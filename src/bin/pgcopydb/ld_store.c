@@ -3511,6 +3511,12 @@ ld_store_replay_txn_free(ReplayDBTxn *txn)
  * The cursor is then the last COMMIT LSN processed, never a BEGIN LSN.
  *
  * Each branch uses the (action, lsn) unique index with a limit of one row.
+ *
+ * A keepalive carries the LSN of the last record streamed, often the COMMIT
+ * LSN just before it. At equal LSN the COMMIT goes first, whatever the row
+ * ids: when the slot sends a transaction again after a restart, its rows get
+ * new ids above a keepalive kept from the previous run, and processing that
+ * keepalive first would move the cursor onto the COMMIT and skip it.
  */
 bool
 ld_store_lookup_output_next_unit(DatabaseCatalog *catalog,
@@ -3530,7 +3536,7 @@ ld_store_lookup_output_next_unit(DatabaseCatalog *catalog,
 		"  select * from (select id, action, xid, lsn, timestamp, message, "
 		"                        nspname, relname, old_type from output "
 		"                  where action = 'K' and lsn > $1 order by lsn limit 1) "
-		") order by lsn, id limit 1";
+		") order by lsn, case when action = 'K' then 1 else 0 end, id limit 1";
 
 	bzero(unit, sizeof(ReplayDBOutputMessage));
 
