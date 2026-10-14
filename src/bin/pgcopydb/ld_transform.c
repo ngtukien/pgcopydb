@@ -26,6 +26,7 @@
 #include "cli_root.h"
 #include "copydb.h"
 #include "env_utils.h"
+#include "ld_depkeys.h"
 #include "ld_pgoutput.h"
 #include "ld_store.h"
 #include "ld_stream.h"
@@ -65,6 +66,13 @@ static bool stream_transform_cdc_file_hook(StreamSpecs *specs,
 
 static bool stream_transform_prepare_message(StreamSpecs *specs,
 											 ReplayDBOutputMessage *output);
+
+static void stream_transform_free_txn(LogicalTransaction *txn);
+
+static bool stream_transform_write_replay_txn_rows(StreamSpecs *specs,
+												   LogicalTransaction *txn,
+												   ReplayDBStmt *begin,
+												   DepKeySet *keys);
 
 static bool stream_write_insert(ReplayDBStmt *replayStmt,
 								LogicalMessageInsert *insert);
@@ -389,8 +397,12 @@ stream_transform_prepare_message(StreamSpecs *specs,
 				  output->jsonBuffer != NULL ? output->jsonBuffer : "(null)",
 				  output->jsonBuffer != NULL && strlen(output->jsonBuffer) > 1024
 				  ? "..." : "");
+		json_value_free(json);
 		return false;
 	}
+
+	/* the parsers copy what they keep */
+	json_value_free(json);
 
 	return true;
 }
@@ -423,6 +435,11 @@ stream_transform_write_transaction(StreamSpecs *specs)
 			}
 
 			/* then prepare a new transaction, reusing the same memory area */
+			if (currentMsg->isTransaction)
+			{
+				stream_transform_free_txn(&(currentMsg->command.tx));
+			}
+
 			LogicalMessage empty = { 0 };
 			*currentMsg = empty;
 
@@ -1842,7 +1859,39 @@ stream_transform_write_replay_stmt(StreamSpecs *specs)
 			return false;
 		}
 
+		if (!ld_store_replaydb_begin(specs->replayDB))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
 		if (!ld_store_insert_replay_stmt(specs->replayDB, &replayStmt))
+		{
+			/* errors have already been logged */
+			(void) ld_store_replaydb_rollback(specs->replayDB);
+			return false;
+		}
+
+		/* a keepalive lets apply report progress while the source is idle */
+		if (replayStmt.action == STREAM_ACTION_KEEPALIVE)
+		{
+			ReplayDBTxn queued = {
+				.kind = REPLAY_TXN_KIND_KEEPALIVE,
+				.lsn = msg->lsn,
+				.endlsn = msg->lsn
+			};
+
+			strlcpy(queued.timestamp, msg->timestamp, sizeof(queued.timestamp));
+
+			if (!ld_store_insert_replay_txn(specs->replayDB, &queued))
+			{
+				/* errors have already been logged */
+				(void) ld_store_replaydb_rollback(specs->replayDB);
+				return false;
+			}
+		}
+
+		if (!ld_store_replaydb_commit(specs->replayDB))
 		{
 			/* errors have already been logged */
 			return false;
@@ -1877,7 +1926,65 @@ stream_transform_write_replay_txn(StreamSpecs *specs)
 
 	strlcpy(begin.timestamp, txn->timestamp, sizeof(begin.timestamp));
 
-	if (!ld_store_insert_replay_stmt(specs->replayDB, &begin))
+	/*
+	 * The whole transaction (replay rows and its row in the apply queue) is
+	 * written in one SQLite transaction: apply never sees a part of it.
+	 */
+	if (!ld_store_replaydb_begin(specs->replayDB))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	DepKeySet keys = { 0 };
+
+	bool success = stream_transform_write_replay_txn_rows(specs, txn, &begin, &keys);
+
+	if (success)
+	{
+		ReplayDBTxn queued = {
+			.kind = txn->rollback ? REPLAY_TXN_KIND_ROLLBACK : REPLAY_TXN_KIND_TXN,
+			.xid = txn->xid,
+			.begin_id = begin.id,
+			.lsn = txn->beginLSN,
+			.endlsn = begin.endlsn
+		};
+
+		strlcpy(queued.timestamp, txn->timestamp, sizeof(queued.timestamp));
+
+		success = depkeys_serialize(&keys, &(queued.keys), &(queued.tables)) &&
+				  ld_store_insert_replay_txn(specs->replayDB, &queued);
+
+		free(queued.keys);
+		free(queued.tables);
+	}
+
+	depkeys_reset(&keys);
+
+	if (!success)
+	{
+		(void) ld_store_replaydb_rollback(specs->replayDB);
+		return false;
+	}
+
+	return ld_store_replaydb_commit(specs->replayDB);
+}
+
+
+/*
+ * stream_transform_write_replay_txn_rows inserts the BEGIN, statements and
+ * COMMIT (or ROLLBACK) rows of a transaction, and collects its dependency
+ * keys.
+ */
+static bool
+stream_transform_write_replay_txn_rows(StreamSpecs *specs,
+									   LogicalTransaction *txn,
+									   ReplayDBStmt *begin,
+									   DepKeySet *keys)
+{
+	StreamContext *privateContext = &(specs->private);
+
+	if (!ld_store_insert_replay_stmt(specs->replayDB, begin))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1898,6 +2005,12 @@ stream_transform_write_replay_txn(StreamSpecs *specs)
 
 	for (; currentStmt != NULL; currentStmt = currentStmt->next)
 	{
+		if (!depkeys_add_statement(privateContext, keys, currentStmt))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
 		ReplayDBStmt stmt = {
 			.action = currentStmt->action,
 			.xid = currentStmt->xid,
@@ -1958,7 +2071,12 @@ stream_transform_write_replay_txn(StreamSpecs *specs)
 			}
 		}
 
-		if (!ld_store_insert_replay_stmt(specs->replayDB, &stmt))
+		bool inserted = ld_store_insert_replay_stmt(specs->replayDB, &stmt);
+
+		free(stmt.stmt);
+		free(stmt.data);
+
+		if (!inserted)
 		{
 			/* errors have already been logged */
 			return false;
@@ -2989,6 +3107,669 @@ markGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
 			}
 		}
 	}
+
+	return true;
+}
+
+
+/*
+ * stream_transform_free_tuples frees the tuples of a statement.
+ */
+static void
+stream_transform_free_tuples(LogicalMessageTupleArray *tuples)
+{
+	for (int t = 0; t < tuples->count; t++)
+	{
+		LogicalMessageTuple *tuple = &(tuples->array[t]);
+
+		for (int a = 0; a < tuple->attributes.count; a++)
+		{
+			free(tuple->attributes.array[a].attname);
+		}
+
+		free(tuple->attributes.array);
+
+		for (int r = 0; r < tuple->values.count; r++)
+		{
+			LogicalMessageValues *values = &(tuple->values.array[r]);
+
+			for (int c = 0; c < values->cols; c++)
+			{
+				LogicalMessageValue *v = &(values->array[c]);
+
+				/* the value union holds a string for the other types only */
+				if (v->oid != BOOLOID && v->oid != INT8OID && v->oid != FLOAT8OID)
+				{
+					free(v->val.str);
+				}
+			}
+
+			free(values->array);
+		}
+
+		free(tuple->values.array);
+	}
+
+	free(tuples->array);
+}
+
+
+/*
+ * stream_transform_free_txn frees the statements of a transaction once it is
+ * written to the replayDB. Statements merged into a previous one (multi-rows
+ * INSERT or DELETE) are not linked anymore and their values have moved.
+ */
+static void
+stream_transform_free_txn(LogicalTransaction *txn)
+{
+	LogicalTransactionStatement *stmt = txn->first;
+
+	while (stmt != NULL)
+	{
+		LogicalTransactionStatement *next = stmt->next;
+		LogicalMessageRelation *rel = NULL;
+
+		switch (stmt->action)
+		{
+			case STREAM_ACTION_INSERT:
+			{
+				rel = &(stmt->stmt.insert.table);
+				stream_transform_free_tuples(&(stmt->stmt.insert.new));
+				break;
+			}
+
+			case STREAM_ACTION_UPDATE:
+			{
+				rel = &(stmt->stmt.update.table);
+				stream_transform_free_tuples(&(stmt->stmt.update.old));
+				stream_transform_free_tuples(&(stmt->stmt.update.new));
+				break;
+			}
+
+			case STREAM_ACTION_DELETE:
+			{
+				rel = &(stmt->stmt.delete.table);
+				stream_transform_free_tuples(&(stmt->stmt.delete.old));
+				break;
+			}
+
+			case STREAM_ACTION_TRUNCATE:
+			{
+				rel = &(stmt->stmt.truncate.table);
+				break;
+			}
+
+			default:
+			{
+				break;
+			}
+		}
+
+		if (rel != NULL)
+		{
+			free(rel->nspname);
+			free(rel->relname);
+		}
+
+		free(stmt);
+		stmt = next;
+	}
+
+	txn->first = NULL;
+	txn->last = NULL;
+}
+
+
+/*
+ * The standalone transform process.
+ *
+ * It reads the output.db files that receive writes, in source commit order,
+ * and writes for each transaction its SQL statements (replay table) and its
+ * entry in the apply queue (txn table) of the matching replay.db file. It
+ * runs from the start of the follow, during the initial copy too, and never
+ * waits for apply: apply reads what transform has queued.
+ *
+ * Its position is in its own output: the highest COMMIT (or keepalive) LSN
+ * queued in the replay.db files, so that a restart resumes there.
+ */
+typedef struct TransformRun
+{
+	DatabaseCatalog output;     /* output.db being read */
+	DatabaseCatalog replay;     /* replay.db being written */
+	int64_t fileId;             /* cdc_files.id of the pair */
+	uint64_t cursor;            /* last COMMIT, ROLLBACK or KEEPALIVE LSN queued */
+	uint64_t units;
+	bool follow;                /* wait for receive, or drain what is there */
+} TransformRun;
+
+static bool transform_cdc_file(DatabaseCatalog *sourceDB, const char *sql,
+							   int64_t param, int64_t *id, char *filename,
+							   bool *done);
+static bool transform_open_pair(StreamSpecs *specs, TransformRun *run,
+								int64_t id, const char *outputFile);
+static bool transform_next_pair(StreamSpecs *specs, TransformRun *run,
+								bool *advanced);
+static bool transform_receive_done(StreamSpecs *specs);
+static bool stream_transform_run(StreamSpecs *specs, bool follow);
+static bool stream_transform_unit_hook(StreamSpecs *specs,
+									   ReplayDBOutputMessage *output,
+									   bool *stop);
+
+
+/*
+ * stream_transform_worker is the transform sub-process of the follow
+ * command: it runs until receive is done and everything is transformed, or
+ * until it is signaled.
+ */
+bool
+stream_transform_worker(StreamSpecs *specs)
+{
+	return stream_transform_run(specs, true);
+}
+
+
+/*
+ * stream_transform_drain transforms what the output.db files contain and
+ * returns, as used by the stream catchup command.
+ */
+bool
+stream_transform_drain(StreamSpecs *specs)
+{
+	return stream_transform_run(specs, false);
+}
+
+
+static bool
+stream_transform_run(StreamSpecs *specs, bool follow)
+{
+	DatabaseCatalog *sourceDB = specs->sourceDB;
+	TransformRun run = { .follow = follow };
+
+	if (!stream_transform_context_init(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* the transform hooks read and write through these */
+	specs->outputDB = &(run.output);
+	specs->replayDB = &(run.replay);
+	specs->private.outputDB = &(run.output);
+	specs->private.replayDB = &(run.replay);
+	specs->private.applyState = NULL;
+
+	/*
+	 * Start with the file pair that holds the current apply position: the
+	 * earlier ones are applied already, and may have been removed.
+	 */
+	CopyDBSentinel sentinel = { 0 };
+
+	if (!sentinel_get(sourceDB, &sentinel))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	run.cursor = sentinel.replay_lsn;
+
+	int64_t id = 0;
+	char filename[MAXPGPATH] = { 0 };
+	bool done = false;
+	bool firstLoop = true;
+
+	while (id == 0)
+	{
+		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+		{
+			return true;
+		}
+
+		char lsn[PG_LSN_MAXLENGTH] = { 0 };
+
+		sformat(lsn, sizeof(lsn), "%08X/%08X", LSN_FORMAT_ARGS(run.cursor));
+
+		char *atLSN =
+			"  select id, filename, done_time_epoch is not null from cdc_files "
+			"   where startpos <= $1 order by id desc limit 1";
+
+		char *first =
+			"  select id, filename, done_time_epoch is not null from cdc_files "
+			"   where $1 = $1 order by id limit 1";
+
+		/* bind the LSN as text through the int64 slot is not possible here */
+		if (run.cursor != InvalidXLogRecPtr)
+		{
+			SQLiteQuery query = { 0 };
+
+			if (!catalog_sql_prepare(sourceDB->db, atLSN, &query))
+			{
+				return false;
+			}
+
+			sqlite3_bind_text(query.ppStmt, 1, lsn, -1, SQLITE_TRANSIENT);
+
+			int rc = catalog_sql_step(&query);
+
+			if (rc == SQLITE_ROW)
+			{
+				id = sqlite3_column_int64(query.ppStmt, 0);
+				strlcpy(filename, (char *) sqlite3_column_text(query.ppStmt, 1),
+						sizeof(filename));
+			}
+
+			(void) catalog_sql_finalize(&query);
+		}
+
+		if (id == 0 &&
+			!transform_cdc_file(sourceDB, first, 0, &id, filename, &done))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (id == 0)
+		{
+			if (!follow)
+			{
+				log_info("Transform: no CDC file to transform");
+				return true;
+			}
+
+			if (firstLoop)
+			{
+				log_info("Transform is waiting for the first CDC file");
+				firstLoop = false;
+			}
+
+			pg_usleep(100 * 1000);
+		}
+	}
+
+	/* walk over the pairs that transform completed already */
+	for (;;)
+	{
+		if (!transform_open_pair(specs, &run, id, filename))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		uint64_t endlsn = InvalidXLogRecPtr;
+		bool switched = false;
+
+		if (!ld_store_replay_txn_last(&(run.replay), &endlsn, &switched))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		run.cursor = Max(run.cursor, endlsn);
+
+		if (!switched)
+		{
+			break;
+		}
+
+		char *next =
+			"  select id, filename, done_time_epoch is not null from cdc_files "
+			"   where id > $1 order by id limit 1";
+
+		int64_t nextId = 0;
+
+		if (!transform_cdc_file(sourceDB, next, id, &nextId, filename, &done))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (nextId == 0)
+		{
+			log_error("BUG: CDC file pair %lld is complete but has no successor",
+					  (long long) id);
+			return false;
+		}
+
+		id = nextId;
+	}
+
+	log_info("Transforming changes from \"%s\" after LSN %X/%X",
+			 run.output.dbfile,
+			 LSN_FORMAT_ARGS(run.cursor));
+
+	(void) pipeline_state_start(sourceDB, "transform", run.cursor);
+
+	bool success = true;
+	uint64_t lastLog = time(NULL);
+
+	for (;;)
+	{
+		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+		{
+			log_info("Transform process received a shutdown signal, stopping");
+			break;
+		}
+
+		/*
+		 * Check whether receive is done before looking for more work, so
+		 * that "done and nothing left" also covers what receive wrote last.
+		 */
+		bool receiveDone = !follow || transform_receive_done(specs);
+
+		ReplayDBOutputMessage unit = { 0 };
+
+		if (!ld_store_lookup_output_next_unit(&(run.output), run.cursor, &unit))
+		{
+			success = false;
+			break;
+		}
+
+		if (unit.lsn != InvalidXLogRecPtr)
+		{
+			bool found = true;
+
+			free(unit.jsonBuffer);
+			unit.jsonBuffer = NULL;
+
+			if (!ld_store_iter_output_unit(specs, &unit,
+										   &stream_transform_unit_hook,
+										   &found))
+			{
+				log_error("Failed to transform the changes at LSN %X/%X",
+						  LSN_FORMAT_ARGS(unit.lsn));
+				success = false;
+				break;
+			}
+
+			if (!found)
+			{
+				log_error("Failed to transform transaction %u committed at "
+						  "LSN %X/%X: its BEGIN is not in \"%s\"",
+						  unit.xid,
+						  LSN_FORMAT_ARGS(unit.lsn),
+						  run.output.dbfile);
+				success = false;
+				break;
+			}
+
+			run.cursor = unit.lsn;
+			++run.units;
+
+			if (time(NULL) - lastLog >= 10)
+			{
+				log_info("Transform queued %llu units, at LSN %X/%X",
+						 (unsigned long long) run.units,
+						 LSN_FORMAT_ARGS(run.cursor));
+				lastLog = time(NULL);
+			}
+
+			continue;
+		}
+
+		/* nothing more in this file: move on when receive has closed it */
+		bool advanced = false;
+
+		if (!transform_next_pair(specs, &run, &advanced))
+		{
+			success = false;
+			break;
+		}
+
+		if (advanced)
+		{
+			continue;
+		}
+
+		if (receiveDone)
+		{
+			log_info("Transform is done, %llu units queued, at LSN %X/%X",
+					 (unsigned long long) run.units,
+					 LSN_FORMAT_ARGS(run.cursor));
+			break;
+		}
+
+		pg_usleep(100 * 1000);
+	}
+
+	(void) pipeline_state_end(sourceDB, "transform", run.cursor, success);
+
+	ld_store_close_raw(&(run.output));
+	ld_store_close_raw(&(run.replay));
+
+	if (specs->transformPGSQL.connection != NULL)
+	{
+		(void) pgsql_finish(&(specs->transformPGSQL));
+	}
+
+	return success;
+}
+
+
+/*
+ * stream_transform_unit_hook parses one output row and, at the end of a
+ * transaction or for a keepalive, writes it to the replayDB.
+ */
+static bool
+stream_transform_unit_hook(StreamSpecs *specs,
+						   ReplayDBOutputMessage *output,
+						   bool *stop)
+{
+	if (!stream_transform_prepare_message(specs, output))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return stream_transform_write_transaction(specs);
+}
+
+
+/*
+ * transform_receive_done is true once the receive process of this follow run
+ * has exited cleanly: a done row left by a previous run does not count.
+ */
+static bool
+transform_receive_done(StreamSpecs *specs)
+{
+	PipelineStateEntry rs = { 0 };
+
+	if (!pipeline_state_get(specs->sourceDB, "receive", &rs) ||
+		rs.process_name[0] == '\0' ||
+		strcmp(rs.run_state, "done") != 0)
+	{
+		return false;
+	}
+
+	return specs->prefetch.pid <= 0 || rs.pid == specs->prefetch.pid;
+}
+
+
+/*
+ * transform_cdc_file runs a query on cdc_files that returns at most one
+ * (id, filename, done) row; id is 0 when there is none.
+ */
+static bool
+transform_cdc_file(DatabaseCatalog *sourceDB, const char *sql, int64_t param,
+				   int64_t *id, char *filename, bool *done)
+{
+	SQLiteQuery query = { 0 };
+
+	*id = 0;
+	*done = false;
+
+	if (!catalog_sql_prepare(sourceDB->db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	sqlite3_bind_int64(query.ppStmt, 1, param);
+
+	int rc = catalog_sql_step(&query);
+
+	if (rc == SQLITE_ROW)
+	{
+		*id = sqlite3_column_int64(query.ppStmt, 0);
+		strlcpy(filename, (char *) sqlite3_column_text(query.ppStmt, 1), MAXPGPATH);
+		*done = sqlite3_column_int(query.ppStmt, 2) != 0;
+	}
+	else if (rc != SQLITE_DONE)
+	{
+		log_error("Failed to query the CDC files: %s", sqlite3_errmsg(sourceDB->db));
+		(void) catalog_sql_finalize(&query);
+		return false;
+	}
+
+	return catalog_sql_finalize(&query);
+}
+
+
+/*
+ * transform_open_pair opens an output.db for reading and its replay.db for
+ * writing, creating the replay.db when needed.
+ */
+static bool
+transform_open_pair(StreamSpecs *specs, TransformRun *run,
+					int64_t id, const char *outputFile)
+{
+	char replayFile[MAXPGPATH] = { 0 };
+
+	ld_store_replaydb_filename(outputFile, replayFile, sizeof(replayFile));
+
+	if (!ld_store_open_raw(&(run->output), outputFile,
+						   DATABASE_CATALOG_TYPE_OUTPUT, false) ||
+		!ld_store_open_raw(&(run->replay), replayFile,
+						   DATABASE_CATALOG_TYPE_REPLAY, true))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * No fsync at each SQLite commit: after an OS crash transform resumes
+	 * from the last transaction that reached the disk, and the source slot
+	 * keeps the changes until apply has made them durable on the target.
+	 */
+	if (!catalog_execute(&(run->replay), "PRAGMA synchronous = NORMAL"))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	run->fileId = id;
+
+	return true;
+}
+
+
+/*
+ * transform_next_pair moves to the next file pair once receive has closed the
+ * current output.db and created the next one. The next replay.db is created
+ * before the current one is marked complete, so that apply always finds it.
+ */
+static bool
+transform_next_pair(StreamSpecs *specs, TransformRun *run, bool *advanced)
+{
+	DatabaseCatalog *sourceDB = specs->sourceDB;
+	char filename[MAXPGPATH] = { 0 };
+	int64_t id = 0;
+	bool done = false;
+
+	*advanced = false;
+
+	char *current =
+		"  select id, filename, done_time_epoch is not null from cdc_files "
+		"   where id = $1";
+
+	if (!transform_cdc_file(sourceDB, current, run->fileId, &id, filename, &done))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!done)
+	{
+		return true;
+	}
+
+	/*
+	 * The file is closed, and was closed before we found it had no more work
+	 * for us? Check again now that we know it is closed.
+	 */
+	ReplayDBOutputMessage unit = { 0 };
+
+	if (!ld_store_lookup_output_next_unit(&(run->output), run->cursor, &unit))
+	{
+		return false;
+	}
+
+	free(unit.jsonBuffer);
+
+	if (unit.lsn != InvalidXLogRecPtr)
+	{
+		*advanced = true;
+		return true;
+	}
+
+	char *next =
+		"  select id, filename, done_time_epoch is not null from cdc_files "
+		"   where id > $1 order by id limit 1";
+
+	int64_t previousId = run->fileId;
+	char previousReplay[MAXPGPATH] = { 0 };
+
+	strlcpy(previousReplay, run->replay.dbfile, sizeof(previousReplay));
+
+	if (!transform_cdc_file(sourceDB, next, run->fileId, &id, filename, &done))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (id == 0)
+	{
+		/* receive closed this file and has not opened the next one yet */
+		return true;
+	}
+
+	if (!transform_open_pair(specs, run, id, filename))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now mark the previous pair as complete for apply */
+	DatabaseCatalog previous = { 0 };
+
+	if (!ld_store_open_raw(&previous, previousReplay,
+						   DATABASE_CATALOG_TYPE_REPLAY, false))
+	{
+		return false;
+	}
+
+	ReplayDBTxn queued = {
+		.kind = REPLAY_TXN_KIND_SWITCH,
+		.lsn = run->cursor,
+		.endlsn = run->cursor
+	};
+
+	bool success = ld_store_replaydb_begin(&previous) &&
+				   ld_store_insert_replay_txn(&previous, &queued) &&
+				   ld_store_replaydb_commit(&previous);
+
+	ld_store_close_raw(&previous);
+
+	if (!success)
+	{
+		log_error("Failed to mark replayDB \"%s\" complete", previousReplay);
+		return false;
+	}
+
+	log_info("Transform moved from CDC file pair %lld to %lld: \"%s\"",
+			 (long long) previousId,
+			 (long long) id,
+			 run->output.dbfile);
+
+	*advanced = true;
 
 	return true;
 }

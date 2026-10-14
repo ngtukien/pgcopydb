@@ -22,6 +22,7 @@
 #include "cli_root.h"
 #include "copydb.h"
 #include "env_utils.h"
+#include "ld_depkeys.h"
 #include "ld_store.h"
 #include "ld_stream.h"
 #include "lock_utils.h"
@@ -33,6 +34,12 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+
+#if defined(LIBPQ_HAS_PIPELINING) && LIBPQ_HAS_PIPELINING
+#define pqPipelineModeEnabled(conn) (PQpipelineStatus(conn) == PQ_PIPELINE_ON)
+#else
+#define pqPipelineModeEnabled(conn) (false)
+#endif
 
 GUC applySettingsSync[] = {
 	COMMON_GUC_SETTINGS,
@@ -63,26 +70,198 @@ static bool stream_apply_dml(StreamApplyContext *context, ReplayDBStmt *s);
 static bool stream_apply_transaction(StreamApplyContext *context,
 									 uint32_t xid,
 									 uint64_t begin_id,
-									 uint64_t commitLSN);
-
-bool stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context);
+									 uint64_t commitLSN,
+									 bool sync);
 
 /*
- * stream_apply_catchup applies CDC changes stored in the SQLite replayDB to
- * the target database, catching up from the last-known replay LSN position.
+ * Parallel apply.
  *
- * It replaces the old file-based approach (read .sql files written by
- * pgcopydb stream prefetch/transform) with a direct read from the replay
- * and stmt tables of the replayDB SQLite file.
+ * The apply process is a scheduler: it reads the apply queue that transform
+ * writes (the txn table of the replay.db files, in source commit order) and
+ * hands each transaction to one of --apply-jobs worker processes, each with
+ * its own connection to the target.
+ *
+ * Two transactions run at the same time only when their dependency keys do
+ * not intersect (see ld_depkeys.c): a transaction waits for every earlier
+ * transaction that touched one of its keys, and a barrier transaction runs
+ * alone. Independent transactions may then commit on the target in another
+ * order than on the source, never two changes of a same row or a same
+ * table-level key.
+ *
+ * Progress is the watermark: the commit LSN up to which every transaction is
+ * applied. With a single worker the worker commits in source order and the
+ * replication origin tracks the watermark as before. With several workers,
+ * each applied transaction also inserts its commit LSN into a small table on
+ * the target, pgcopydb.apply_txn, in the same target transaction; the
+ * scheduler advances the replication origin to the watermark and deletes the
+ * rows below it. After a crash, the transactions above the origin position
+ * that have a row there are known to be applied and are skipped: a target
+ * commit and its progress record are never separated.
+ */
+
+#define APPLY_WINDOW 4096
+#define APPLY_FETCH_BATCH 256
+#define APPLY_PERSIST_INTERVAL_MS 1000
+
+#define APPLY_PROGRESS_SCHEMA "pgcopydb"
+#define APPLY_PROGRESS_TABLE "pgcopydb.apply_txn"
+
+typedef struct ApplyJob
+{
+	uint64_t seq;
+	uint32_t xid;
+	uint64_t begin_id;
+	uint64_t commitLSN;
+	bool sync;
+	char replayFile[MAXPGPATH];
+} ApplyJob;
+
+typedef struct ApplyResult
+{
+	int worker;
+	uint64_t seq;
+	bool success;
+} ApplyResult;
+
+typedef enum
+{
+	APPLY_ENTRY_PENDING = 0,
+	APPLY_ENTRY_RUNNING,
+	APPLY_ENTRY_DONE
+} ApplyEntryState;
+
+typedef struct ApplyEntry
+{
+	uint64_t seq;
+	StreamAction kind;
+	uint32_t xid;
+	uint64_t begin_id;
+	uint64_t lsn;
+	uint64_t endlsn;
+	bool barrier;
+	int file;                   /* index in ApplyScheduler.files */
+	ApplyEntryState state;
+	bool sent;                  /* handed to a worker */
+
+	int nkeys;
+	uint64_t *keys;             /* malloc'ed */
+
+	int ndeps;
+	uint64_t *deps;             /* malloc'ed: seq of entries to wait for */
+} ApplyEntry;
+
+typedef struct ApplyKeyOwner
+{
+	uint64_t key;
+	uint64_t seq;               /* last entry that has this key */
+	UT_hash_handle hh;
+} ApplyKeyOwner;
+
+typedef struct ApplySkip
+{
+	uint64_t lsn;
+	UT_hash_handle hh;
+} ApplySkip;
+
+typedef struct ApplyWorker
+{
+	pid_t pid;
+	int jobFd;
+	bool busy;
+} ApplyWorker;
+
+typedef struct ApplyScheduler
+{
+	StreamSpecs *specs;
+	StreamApplyContext *context;
+
+	int jobs;
+	ApplyWorker *workers;
+	int resultFd;
+	bool tableMode;
+
+	/* entries with seq in [head, tail), at ring[seq % APPLY_WINDOW] */
+	ApplyEntry *ring;
+	uint64_t head;
+	uint64_t tail;
+	uint64_t lastBarrier;       /* seq + 1 of the last barrier, 0 when none */
+	uint64_t limit;             /* entries from this seq are after endpos */
+	ApplyKeyOwner *owners;
+
+	/* the replay.db being read, and the files entries refer to */
+	DatabaseCatalog replay;
+	int64_t fileId;
+	uint64_t lastTxnId;
+	int nfiles;
+	char (*files)[MAXPGPATH];
+
+	bool fetchDone;
+
+	uint64_t watermark;         /* applied up to this commit LSN */
+	uint64_t persisted;
+	uint64_t lastPersistMs;
+	ApplySkip *skip;
+
+	uint64_t applied;
+	uint64_t barriers;
+	uint64_t lastLog;
+	bool failed;
+} ApplyScheduler;
+
+static bool apply_scheduler_setup(StreamSpecs *specs,
+								  StreamApplyContext *context,
+								  ApplyScheduler *s);
+static bool apply_scheduler_run(ApplyScheduler *s);
+static void apply_scheduler_stop_workers(ApplyScheduler *s);
+static bool apply_start_workers(ApplyScheduler *s);
+static void apply_worker_main(ApplyScheduler *s, int k, int jobFd, int resultFd);
+static bool apply_fetch(ApplyScheduler *s, bool *fetched);
+static bool apply_open_queue(ApplyScheduler *s, bool *ready);
+static bool apply_enqueue(ApplyScheduler *s, ReplayDBTxn *txn);
+static void apply_check_endpos(ApplyScheduler *s);
+static bool apply_dispatch(ApplyScheduler *s, bool *dispatched);
+static bool apply_collect(ApplyScheduler *s, int timeoutMs, bool *collected);
+static void apply_advance(ApplyScheduler *s);
+static bool apply_persist(ApplyScheduler *s, bool force);
+static bool apply_transform_done(ApplyScheduler *s);
+static bool apply_tables_need_barrier(ApplyScheduler *s, const char *tables);
+static bool apply_load_progress_table(ApplyScheduler *s);
+static uint64_t apply_now_ms(void);
+static bool apply_read_full(int fd, void *buf, size_t len, bool *eof);
+static bool apply_write_full(int fd, const void *buf, size_t len);
+
+#define ENTRY(s, seq) (&((s)->ring[(seq) % APPLY_WINDOW]))
+
+
+/*
+ * stream_apply_catchup applies the CDC changes queued in the replayDB files
+ * to the target database, from the replication origin position, with
+ * specs->applyJobs worker processes.
+ *
+ * When no transform process runs beside us (pgcopydb stream catchup), the
+ * changes that receive has written are transformed first.
  */
 bool
 stream_apply_catchup(StreamSpecs *specs)
 {
 	StreamApplyContext context = { 0 };
+	ApplyScheduler s = { 0 };
 
-	if (!stream_apply_setup(specs, &context))
+	if (specs->transform.pid <= 0)
+	{
+		if (!stream_transform_drain(specs))
+		{
+			log_error("Failed to transform the CDC changes, "
+					  "see above for details");
+			return false;
+		}
+	}
+
+	if (!apply_scheduler_setup(specs, &context, &s))
 	{
 		log_error("Failed to setup for catchup, see above for details");
+		apply_scheduler_stop_workers(&s);
+		(void) stream_apply_cleanup(&context);
 		return false;
 	}
 
@@ -93,569 +272,1524 @@ stream_apply_catchup(StreamSpecs *specs)
 		return true;
 	}
 
-	/*
-	 * In catchup-only mode (no live pipe from receive), read the receive
-	 * process's pipeline_state to learn where it stopped.  Use that LSN as
-	 * our endpos if the caller didn't supply one — this is how apply knows
-	 * when to stop without an ENDPOS marker in the replay table.
-	 */
-	if (specs->pipe_rt[0] < 0 && context.endpos == InvalidXLogRecPtr)
-	{
-		PipelineStateEntry rs = { 0 };
-
-		if (pipeline_state_get(specs->sourceDB, "receive", &rs) &&
-			rs.process_name[0] != '\0' &&
-			strcmp(rs.run_state, "done") == 0 &&
-			rs.run_end_lsn != InvalidXLogRecPtr)
-		{
-			context.endpos = rs.run_end_lsn;
-			log_info("Apply catchup: using receive run_end_lsn %X/%X as endpos",
-					 LSN_FORMAT_ARGS(context.endpos));
-		}
-	}
-
-	/*
-	 * Initialise the transform context once (opens target connection for
-	 * identifier quoting and prepares the generated-columns cache).
-	 * Then do an initial pass to populate replayDB from whatever outputDB
-	 * already contains (in CATCHUP mode this covers everything; in FOLLOW
-	 * mode the main loop will call stream_transform_from_outputdb() again
-	 * as more rows arrive in outputDB).
-	 */
-	if (!stream_transform_context_init(specs))
-	{
-		log_error("Failed to initialize inline transform context");
-		return false;
-	}
-
-	/*
-	 * The single apply driver loop (stream_apply_replaydb) performs the inline
-	 * transform stage itself, one dispatch per iteration, so there is no
-	 * separate pre-loop transform pass: the first iteration primes replayDB
-	 * from whatever outputDB already contains, and a mid-transaction endpos is
-	 * handled inside the loop like any other terminal condition.
-	 */
 	(void) pipeline_state_start(specs->sourceDB, "apply", context.previousLSN);
 
-	bool success = stream_apply_replaydb(specs, &context);
+	bool success = apply_scheduler_run(&s);
+
+	apply_scheduler_stop_workers(&s);
+
+	/* the last progress, once every worker is done */
+	if (!apply_persist(&s, true))
+	{
+		success = false;
+	}
 
 	(void) pipeline_state_end(specs->sourceDB, "apply",
 							  context.previousLSN, success);
+
+	log_info("Applied %llu transactions with %d worker%s (%llu barriers), "
+			 "up to LSN %X/%X",
+			 (unsigned long long) s.applied,
+			 s.jobs,
+			 s.jobs > 1 ? "s" : "",
+			 (unsigned long long) s.barriers,
+			 LSN_FORMAT_ARGS(context.previousLSN));
+
+	ld_store_close_raw(&(s.replay));
 	(void) stream_apply_cleanup(&context);
 
 	return success;
 }
 
 
-/* how often (in driver iterations) to checkpoint the in-memory apply state */
-#define APPLY_STATE_SYNC_EVERY 64
-
 /*
- * stream_apply_state_progressed returns true when the in-memory apply pipeline
- * state advanced between two snapshots — i.e. the transform stage wrote a new
- * transaction to replayDB, or the apply stage committed one to the target.
- * The driver uses this to avoid declaring "done" in the same iteration in
- * which work was actually produced.
+ * apply_scheduler_setup waits until apply is enabled, finds the starting
+ * position on the target and starts the workers.
  */
 static bool
-stream_apply_state_progressed(const PipelineStateEntry *before,
-							  const PipelineStateEntry *after)
+apply_scheduler_setup(StreamSpecs *specs,
+					  StreamApplyContext *context,
+					  ApplyScheduler *s)
 {
-	return before->last_xid != after->last_xid ||
-		   before->last_txn_begin_lsn != after->last_txn_begin_lsn ||
-		   before->last_txn_end_lsn != after->last_txn_end_lsn ||
-		   before->last_txn_complete != after->last_txn_complete ||
-		   before->last_txn_processed != after->last_txn_processed ||
-		   before->run_end_lsn != after->run_end_lsn;
+	s->specs = specs;
+	s->context = context;
+	s->jobs = specs->applyJobs > 0 ? specs->applyJobs : 1;
+	s->resultFd = -1;
+
+	if (!stream_apply_init_context(context,
+								   specs->sourceDB,
+								   NULL,
+								   &(specs->paths),
+								   specs->connStrings,
+								   specs->origin,
+								   specs->endpos))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	context->logSQL = specs->logSQL;
+
+	if (!stream_apply_wait_for_sentinel(specs, context))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!context->apply)
+	{
+		return true;
+	}
+
+	context->targetDB = specs->targetDB;
+
+	PGSQL *control = &(context->controlPgConn);
+
+	if (!setupConnection(control, context))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	uint32_t oid = 0;
+
+	if (!pgsql_replication_origin_oid(control, context->origin, &oid))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (oid == 0)
+	{
+		log_error("Failed to fetch progress for replication origin \"%s\": "
+				  "replication origin not found on target database",
+				  context->origin);
+		return false;
+	}
+
+	uint64_t originLSN = InvalidXLogRecPtr;
+
+	if (!pgsql_replication_origin_progress(control, context->origin, true,
+										   &originLSN))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	log_info("Setting up previous LSN from replication origin \"%s\" "
+			 "progress at %X/%X",
+			 context->origin,
+			 LSN_FORMAT_ARGS(originLSN));
+
+	context->previousLSN = originLSN;
+	s->watermark = originLSN;
+	s->persisted = originLSN;
+
+	/*
+	 * Several workers need the progress table; so does a single worker when
+	 * a previous run with several workers left rows above the origin.
+	 */
+	if (!apply_load_progress_table(s))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* build the target relkind cache (matview detection) */
+	if (!stream_apply_load_target_relkinds(context))
+	{
+		log_warn("Failed to load target relkind cache; "
+				 "CDC against materialized views will fail if encountered");
+	}
+
+	s->ring = (ApplyEntry *) calloc(APPLY_WINDOW, sizeof(ApplyEntry));
+
+	if (s->ring == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	if (!apply_start_workers(s))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (context->endpos != InvalidXLogRecPtr)
+	{
+		log_info("Catchup-up with changes from LSN %X/%X up to endpos LSN %X/%X",
+				 LSN_FORMAT_ARGS(context->previousLSN),
+				 LSN_FORMAT_ARGS(context->endpos));
+	}
+	else
+	{
+		log_info("Catchup-up with changes from LSN %X/%X",
+				 LSN_FORMAT_ARGS(context->previousLSN));
+	}
+
+	log_info("Applying with %d worker%s (%s progress)",
+			 s->jobs,
+			 s->jobs > 1 ? "s" : "",
+			 s->tableMode ? APPLY_PROGRESS_TABLE : "replication origin");
+
+	return true;
 }
 
 
 /*
- * stream_apply_replaydb is the main catchup loop for the SQLite-based CDC
- * pipeline.  It drives a transaction-oriented outer loop:
- *
- *   1. Fetch the next event (BEGIN or non-txn) from the replayDB.
- *   2. For BEGIN rows, apply the full transaction via stream_apply_transaction().
- *   3. For non-txn events (KEEPALIVE/SWITCH/ENDPOS), call stream_apply_sql().
- *
- * The outer query only returns BEGIN rows whose COMMIT has already been stored
- * (endlsn > previousLSN), so the loop never sees a half-written transaction.
- *
- * Three explicit guards before each transaction:
- *   Guard 1 – commitLSN <= previousLSN:  already applied, skip.
- *   Guard 2 – endpos < beginLSN:         endpos before this txn, stop.
- *   Guard 3 – beginLSN < endpos < commitLSN: endpos is mid-transaction;
- *             we still apply the full transaction and stop afterwards.
- *
- * The loop exits when no more rows, endpos is reached, or a signal arrives.
+ * apply_load_progress_table decides how progress is recorded, prepares the
+ * progress table when needed and loads the transactions it lists above the
+ * replication origin position.
  */
-bool
-stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
+static bool
+apply_load_progress_table(ApplyScheduler *s)
 {
-	DatabaseCatalog *replayDB = specs->replayDB;
+	StreamApplyContext *context = s->context;
+	PGSQL *control = &(context->controlPgConn);
+	char sql[BUFSIZE] = { 0 };
+	char *origin = context->origin;
 
-	if (replayDB == NULL || replayDB->db == NULL)
+	if (strchr(origin, '\'') != NULL)
 	{
-		log_error("BUG: stream_apply_replaydb: replayDB is NULL");
+		log_error("Replication origin name \"%s\" contains a quote", origin);
 		return false;
 	}
 
-	log_info("Applying CDC changes from replayDB \"%s\" after LSN %X/%X",
-			 replayDB->dbfile,
-			 LSN_FORMAT_ARGS(context->previousLSN));
+	SingleValueResultContext exists = { { 0 }, PGSQL_RESULT_BOOL, false };
 
-	context->replayDB = replayDB;
-
-	bool success = true;
-	ReplayDBStmt s = { 0 };
-	bool lock_held = false;
-
-	/*
-	 * pipe_rt[0] carries the out-of-band "receive done" lifecycle signal.
-	 * When receive finishes it writes the final LSN and closes the write end.
-	 * We select() on this fd while waiting for more replay rows, so we wake
-	 * up immediately rather than sleeping 500 ms.
-	 *
-	 * In catchup-only mode (no live pipe) pipe_rd == -1 and we fall back to
-	 * the sentinel.endpos / previousLSN comparison.
-	 */
-	int pipe_rd = (specs->pipe_rt[0] > 0) ? specs->pipe_rt[0] : -1;
-
-	/*
-	 * In-memory apply pipeline state.  Both data-processing stages update it as
-	 * they work: the inline-transform hook (via specs->private.applyState) when
-	 * it writes a complete transaction to replayDB, and the apply stage below
-	 * when it commits one to the target.  Each iteration snapshots it before
-	 * dispatching work and compares afterwards to decide progress.  It is
-	 * checkpointed to sourceDB every APPLY_STATE_SYNC_EVERY iterations and once
-	 * more at end of processing.
-	 */
-	PipelineStateEntry current = { 0 };
-	strlcpy(current.process_name, "apply", sizeof(current.process_name));
-	current.run_start_lsn = context->previousLSN;
-	current.last_txn_end_lsn = context->previousLSN;
-	current.run_end_lsn = context->previousLSN;
-
-	specs->private.applyState = &current;
-
-	int syncCounter = 0;
-
-	for (;;)
+	if (!pgsql_execute_with_params(control,
+								   "select to_regclass($1) is not null",
+								   1, (const Oid[]) { TEXTOID },
+								   (const char *[]) { APPLY_PROGRESS_TABLE },
+								   &exists, &parseSingleValueResult))
 	{
-		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
-		{
-			log_info("Apply process received a shutdown signal, stopping");
-			break;
-		}
+		/* errors have already been logged */
+		return false;
+	}
 
-		/* ── check for upstream-done signal ──────────────────────────── */
-		if (!specs->upstream_done && pipe_rd >= 0)
-		{
-			fd_set rfds;
-			FD_ZERO(&rfds);
-			FD_SET(pipe_rd, &rfds);
-			struct timeval tv = { .tv_sec = 0, .tv_usec = 100 * 1000 };
+	s->tableMode = s->jobs > 1;
 
-			int nready = select(pipe_rd + 1, &rfds, NULL, NULL, &tv);
-			if (nready < 0 && errno != EINTR)
-			{
-				log_error("apply select() on pipe: %m");
-				return false;
-			}
-			if (nready > 0 && FD_ISSET(pipe_rd, &rfds))
-			{
-				(void) stream_recv_upstream_done(specs, pipe_rd);
-				pipe_rd = -1;
+	if (exists.boolVal)
+	{
+		char lsn[PG_LSN_MAXLENGTH] = { 0 };
 
-				/* use signal LSN as our endpos if not already set */
-				if (context->endpos == InvalidXLogRecPtr &&
-					specs->upstream_done_lsn != InvalidXLogRecPtr)
-				{
-					context->endpos = specs->upstream_done_lsn;
-					log_info("Apply endpos set from receive signal: %X/%X",
-							 LSN_FORMAT_ARGS(context->endpos));
-				}
-			}
-		}
+		sformat(lsn, sizeof(lsn), "%X/%X", LSN_FORMAT_ARGS(s->watermark));
+		sformat(sql, sizeof(sql),
+				"select string_agg(commit_lsn::text, ' ') "
+				"  from " APPLY_PROGRESS_TABLE
+				" where origin = '%s' and commit_lsn > '%s'",
+				origin, lsn);
 
-		/*
-		 * Lock the replayDB only while querying for the next event.
-		 * This allows the inline transform (ld_store_iter_output in the
-		 * "no rows" path above) to write new rows without contention,
-		 * avoiding deadlock while apply sleeps waiting for more data.
-		 */
-		if (!semaphore_lock(&(replayDB->sema)))
+		SingleValueResultContext rows = { { 0 }, PGSQL_RESULT_STRING, false };
+
+		if (!pgsql_execute_with_params(control, sql, 0, NULL, NULL,
+									   &rows, &parseSingleValueResult))
 		{
 			/* errors have already been logged */
 			return false;
 		}
-		lock_held = true;
 
-		if (!ld_store_replay_next_event(replayDB, context->previousLSN, &s))
+		if (!rows.isNull && rows.strVal != NULL && rows.strVal[0] != '\0')
+		{
+			int count = 0;
+			char *saveptr = NULL;
+
+			for (char *tok = strtok_r(rows.strVal, " ", &saveptr);
+				 tok != NULL;
+				 tok = strtok_r(NULL, " ", &saveptr))
+			{
+				uint64_t applied = InvalidXLogRecPtr;
+
+				if (!parseLSN(tok, &applied))
+				{
+					log_error("Failed to parse LSN \"%s\" from %s",
+							  tok, APPLY_PROGRESS_TABLE);
+					return false;
+				}
+
+				ApplySkip *skip = (ApplySkip *) calloc(1, sizeof(ApplySkip));
+
+				if (skip == NULL)
+				{
+					log_error(ALLOCATION_FAILED_ERROR);
+					return false;
+				}
+
+				skip->lsn = applied;
+				HASH_ADD(hh, s->skip, lsn, sizeof(skip->lsn), skip);
+				++count;
+			}
+
+			log_info("Found %d transactions applied above LSN %X/%X in %s, "
+					 "they are skipped",
+					 count, LSN_FORMAT_ARGS(s->watermark), APPLY_PROGRESS_TABLE);
+
+			/* keep recording there until the watermark passes them */
+			s->tableMode = true;
+		}
+	}
+
+	if (s->tableMode && !exists.boolVal)
+	{
+		char *ddl =
+			"create schema if not exists " APPLY_PROGRESS_SCHEMA "; "
+			"create table if not exists " APPLY_PROGRESS_TABLE
+			"(origin text not null, commit_lsn pg_lsn not null, "
+			" primary key(origin, commit_lsn))";
+
+		if (!pgsql_execute(control, ddl))
 		{
 			/* errors have already been logged */
-			success = false;
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * apply_start_workers forks the workers, each with its own pipe for jobs and
+ * a shared pipe for the results.
+ */
+static bool
+apply_start_workers(ApplyScheduler *s)
+{
+	int resultPipe[2] = { -1, -1 };
+	int (*jobPipes)[2] = calloc(s->jobs, sizeof(int[2]));
+
+	s->workers = (ApplyWorker *) calloc(s->jobs, sizeof(ApplyWorker));
+
+	if (jobPipes == NULL || s->workers == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	if (pipe(resultPipe) != 0)
+	{
+		log_error("Failed to create the apply result pipe: %m");
+		return false;
+	}
+
+	for (int k = 0; k < s->jobs; k++)
+	{
+		if (pipe(jobPipes[k]) != 0)
+		{
+			log_error("Failed to create the apply job pipe: %m");
+			return false;
+		}
+	}
+
+	fflush(stdout);
+	fflush(stderr);
+
+	for (int k = 0; k < s->jobs; k++)
+	{
+		pid_t pid = fork();
+
+		if (pid == -1)
+		{
+			log_error("Failed to fork apply worker %d: %m", k);
+			return false;
+		}
+
+		if (pid == 0)
+		{
+			/* keep only our job pipe read end and the result write end */
+			for (int j = 0; j < s->jobs; j++)
+			{
+				close(jobPipes[j][1]);
+
+				if (j != k)
+				{
+					close(jobPipes[j][0]);
+				}
+			}
+
+			close(resultPipe[0]);
+
+			apply_worker_main(s, k, jobPipes[k][0], resultPipe[1]);
+
+			/* not reached */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		s->workers[k].pid = pid;
+		s->workers[k].jobFd = jobPipes[k][1];
+		close(jobPipes[k][0]);
+	}
+
+	close(resultPipe[1]);
+	s->resultFd = resultPipe[0];
+
+	free(jobPipes);
+
+	return true;
+}
+
+
+/*
+ * apply_worker_main applies the transactions sent by the scheduler, one at a
+ * time, until the job pipe is closed.
+ */
+static void
+apply_worker_main(ApplyScheduler *s, int k, int jobFd, int resultFd)
+{
+	StreamApplyContext *context = s->context;
+
+	char psTitle[BUFSIZE] = { 0 };
+
+	sformat(psTitle, sizeof(psTitle), "pgcopydb: follow apply worker %d", k);
+	(void) set_ps_title(psTitle);
+
+	/*
+	 * The scheduler connection and SQLite handles belong to the parent: leave
+	 * them alone, without closing them.
+	 */
+	context->controlPgConn.connection = NULL;
+	context->applyPgConn.connection = NULL;
+	context->progressTable = s->tableMode;
+
+	PGSQL *apply = &(context->applyPgConn);
+
+	if (!setupConnection(apply, context))
+	{
+		log_error("Apply worker %d failed to connect to the target", k);
+		exit(EXIT_CODE_TARGET);
+	}
+
+	/* with a single worker, the replication origin follows each commit */
+	if (!s->tableMode &&
+		!pgsql_replication_origin_session_setup(apply, context->origin))
+	{
+		exit(EXIT_CODE_TARGET);
+	}
+
+	if (!pgsql_enable_pipeline_mode(apply))
+	{
+		exit(EXIT_CODE_TARGET);
+	}
+
+	DatabaseCatalog replay = { 0 };
+	int exitCode = EXIT_CODE_QUIT;
+
+	for (;;)
+	{
+		ApplyJob job = { 0 };
+		bool eof = false;
+
+		if (!apply_read_full(jobFd, &job, sizeof(job), &eof))
+		{
+			exitCode = EXIT_CODE_INTERNAL_ERROR;
 			break;
 		}
 
-		if (s.action == STREAM_ACTION_UNKNOWN)
+		if (eof)
 		{
-			/*
-			 * No more rows available in replayDB.  Release the lock so that
-			 * the inline transform can write new rows, then attempt to
-			 * transform more data from outputDB into replayDB.
-			 */
-			semaphore_unlock(&(replayDB->sema));
-			lock_held = false;
-
-			/*
-			 * Replay is drained.  Snapshot the in-memory apply state, then
-			 * dispatch the transform stage (outputDB -> replayDB).  The
-			 * inline-transform hook updates `current` for every complete
-			 * transaction it writes, so comparing against this snapshot tells
-			 * us whether the transform stage made progress this pass.
-			 *
-			 * The call is safe to repeat: ld_store_iter_output uses
-			 * specs->sentinel.replay_lsn as a cursor and only processes rows
-			 * newer than the last committed apply position.  Afterwards
-			 * specs->private.midTxnEndpos may be set, meaning receive finished
-			 * with an uncommitted transaction open.
-			 */
-			PipelineStateEntry before = current;
-
-			if (!stream_transform_from_outputdb(specs, context->previousLSN))
-			{
-				log_warn("Failed to transform from outputDB, will retry");
-			}
-
-			if (specs->private.midTxnEndpos)
-			{
-				log_notice("Apply: inline transform detected mid-transaction "
-						   "endpos — endpos %X/%X fell inside an uncommitted "
-						   "transaction; stopping at last commit %X/%X "
-						   "(replay_lsn stays at last commit boundary)",
-						   LSN_FORMAT_ARGS(context->endpos),
-						   LSN_FORMAT_ARGS(context->previousLSN));
-
-				/*
-				 * Do NOT advance previousLSN to endpos: endpos is inside
-				 * an uncommitted transaction and has no backing Postgres
-				 * COMMIT.  Leave replay_lsn at the last real commit.
-				 * follow_reached_endpos() detects completion via
-				 * pipeline_state["apply"].run_state = 'done'.
-				 */
-				context->reachedEndPos = true;
-				(void) stream_apply_sync_sentinel(context, false);
-				break;
-			}
-
-			if (!stream_apply_sync_sentinel(context, false))
-			{
-				log_warn("Failed to sync sentinel when caught up with replayDB");
-			}
-
-			/* Exit if endpos has been reached via previousLSN */
-			if (context->endpos != InvalidXLogRecPtr &&
-				context->endpos <= context->previousLSN)
-			{
-				context->reachedEndPos = true;
-				log_notice("Apply reached end position %X/%X at LSN %X/%X",
-						   LSN_FORMAT_ARGS(context->endpos),
-						   LSN_FORMAT_ARGS(context->previousLSN));
-				break;
-			}
-
-			/*
-			 * Driver invariant: if the transform stage produced new work this
-			 * pass, loop back and apply it before deciding we are done.  This
-			 * is precisely what prevents declaring "done" in the same
-			 * iteration in which transform wrote a fully-committed transaction
-			 * to replayDB (the bug that dropped the last transaction(s) when
-			 * endpos landed on a commit boundary).
-			 */
-			if (stream_apply_state_progressed(&before, &current))
-			{
-				/* checkpoint progress to sourceDB once in a while */
-				if ((++syncCounter % APPLY_STATE_SYNC_EVERY) == 0)
-				{
-					(void) pipeline_state_sync(specs->sourceDB, &current);
-				}
-
-				continue;
-			}
-
-			/*
-			 * No new work from the transform stage.  Before checking whether
-			 * receive has finished, see if the receive process rotated to a new
-			 * output.db file.  If the current output.db has been closed
-			 * (done_time_epoch IS NOT NULL in cdc_files) and a successor file
-			 * exists, advance to it immediately rather than spinning.
-			 */
-			{
-				bool advanced = false;
-
-				if (!ld_store_advance_cdc_files(specs, &advanced))
-				{
-					log_warn("Failed to check/advance CDC file rotation, "
-							 "will retry");
-
-					/* non-fatal — try again next iteration */
-				}
-				else if (advanced)
-				{
-					/*
-					 * Successfully switched to the next output.db/replay.db
-					 * pair.  Update local aliases so this loop iteration
-					 * processes the new file.
-					 */
-					replayDB = specs->replayDB;
-					context->replayDB = replayDB;
-					continue;
-				}
-			}
-
-			/*
-			 * No new work from the transform stage.  If receive has finished
-			 * there is nothing left to do: everything up to the last committed
-			 * transaction boundary at or before endpos has been applied.
-			 *
-			 * In FOLLOW mode the upstream_done flag signals receive completion;
-			 * in CATCHUP mode (no pipe) consult receive's pipeline_state row.
-			 */
-			if (context->endpos != InvalidXLogRecPtr)
-			{
-				bool receive_done = specs->upstream_done;
-
-				if (!receive_done && pipe_rd < 0)
-				{
-					/* Catchup mode: consult the durable pipeline_state record */
-					PipelineStateEntry ts = { 0 };
-
-					if (pipeline_state_get(specs->sourceDB,
-										   "receive", &ts) &&
-						ts.process_name[0] != '\0' &&
-						strcmp(ts.run_state, "done") == 0)
-					{
-						receive_done = true;
-					}
-				}
-
-				if (receive_done)
-				{
-					log_notice("Apply: receive done and no more complete "
-							   "transactions to transform — stopping at last "
-							   "commit %X/%X",
-							   LSN_FORMAT_ARGS(context->previousLSN));
-
-					context->reachedEndPos = true;
-					(void) stream_apply_sync_sentinel(context, false);
-					break;
-				}
-			}
-
-			/*
-			 * Not caught up yet.  In pipe mode the select() ceiling gives
-			 * ≤100 ms latency; in catchup-only mode sleep briefly.
-			 */
-			if (pipe_rd < 0 && !specs->upstream_done)
-			{
-				pg_usleep(100 * 1000);  /* 100 ms */
-			}
-			continue;
+			break;
 		}
 
-		/*
-		 * We have a row to process. Release the lock now since we've already
-		 * fetched the row data. This allows transform to keep writing while
-		 * we apply the row.
-		 */
-		semaphore_unlock(&(replayDB->sema));
-		lock_held = false;
+		ApplyResult result = { .worker = k, .seq = job.seq, .success = false };
 
-		if (s.action == STREAM_ACTION_BEGIN)
+		if (ld_store_open_raw(&replay, job.replayFile,
+							  DATABASE_CATALOG_TYPE_REPLAY, false))
 		{
-			uint64_t beginLSN = s.lsn;
-			uint64_t commitLSN = s.endlsn;
-			uint32_t xid = s.xid;
-			uint64_t begin_id = s.id;
+			context->replayDB = &replay;
 
-			/* Guard 1: already applied — should not happen given the query,
-			 * but be safe on restart edge cases. */
-			if (commitLSN <= context->previousLSN)
+			result.success = stream_apply_transaction(context,
+													  job.xid,
+													  job.begin_id,
+													  job.commitLSN,
+													  job.sync);
+		}
+
+		if (!apply_write_full(resultFd, &result, sizeof(result)))
+		{
+			exitCode = EXIT_CODE_INTERNAL_ERROR;
+			break;
+		}
+
+		if (!result.success)
+		{
+			exitCode = EXIT_CODE_TARGET;
+			break;
+		}
+	}
+
+	ld_store_close_raw(&replay);
+	(void) pgsql_finish(apply);
+
+	exit(exitCode);
+}
+
+
+/*
+ * apply_scheduler_run is the scheduler main loop.
+ */
+static bool
+apply_scheduler_run(ApplyScheduler *s)
+{
+	StreamApplyContext *context = s->context;
+	bool stopping = false;
+
+	s->lastPersistMs = apply_now_ms();
+	s->lastLog = time(NULL);
+
+	for (;;)
+	{
+		bool collected = false;
+		bool fetched = false;
+		bool dispatched = false;
+
+		if (!stopping && (asked_to_stop || asked_to_stop_fast || asked_to_quit))
+		{
+			log_info("Apply process received a shutdown signal, "
+					 "waiting for the running transactions");
+			stopping = true;
+		}
+
+		if (!apply_collect(s, 0, &collected))
+		{
+			s->failed = true;
+			stopping = true;
+		}
+
+		apply_advance(s);
+
+		int running = 0;
+
+		for (int k = 0; k < s->jobs; k++)
+		{
+			running += s->workers[k].busy ? 1 : 0;
+		}
+
+		if (stopping || s->failed)
+		{
+			if (running == 0)
 			{
-				log_debug("Skip already-applied txn %u commitLSN %X/%X "
-						  "<= previousLSN %X/%X",
-						  xid,
-						  LSN_FORMAT_ARGS(commitLSN),
-						  LSN_FORMAT_ARGS(context->previousLSN));
-				continue;
-			}
-
-			/* Guard 2: endpos lies entirely before this transaction. */
-			if (context->endpos != InvalidXLogRecPtr &&
-				context->endpos < beginLSN)
-			{
-				context->reachedEndPos = true;
-
-				log_notice("Apply reached end position %X/%X before "
-						   "xid %u beginLSN %X/%X — stopping at "
-						   "last commit %X/%X",
-						   LSN_FORMAT_ARGS(context->endpos),
-						   xid,
-						   LSN_FORMAT_ARGS(beginLSN),
-						   LSN_FORMAT_ARGS(context->previousLSN));
-
-				/*
-				 * Do NOT advance previousLSN to endpos.  endpos is between
-				 * two transactions and has no backing Postgres COMMIT.
-				 * Leave replay_lsn at the last real commit so the Postgres
-				 * origin position remains accurate.
-				 *
-				 * follow_reached_endpos() detects this case via its secondary
-				 * pipeline_state check (both transform and apply 'done').
-				 */
-				(void) stream_apply_sync_sentinel(context, false);
-				break;
-			}
-
-			/*
-			 * Guard 3: endpos falls mid-transaction.
-			 *
-			 * beginLSN < endpos < commitLSN means the endpos checkpoint was
-			 * set to a WAL position inside this uncommitted transaction.  We
-			 * must apply the full transaction (cannot partially apply it), so
-			 * we do not stop here.  After the commit we will set reachedEndPos.
-			 *
-			 * Note: when beginLSN == commitLSN (single-DML autocommit) the
-			 * strict inequalities make this condition false — correct, since
-			 * there is no "inside" the transaction to straddle.
-			 */
-			bool midTxnEndpos =
-				context->endpos != InvalidXLogRecPtr &&
-				beginLSN < context->endpos &&
-				context->endpos < commitLSN;
-
-			if (midTxnEndpos)
-			{
-				log_notice("Apply endpos %X/%X falls mid-transaction "
-						   "(xid %u begin %X/%X commit %X/%X); "
-						   "applying full transaction then stopping",
-						   LSN_FORMAT_ARGS(context->endpos),
-						   xid,
-						   LSN_FORMAT_ARGS(beginLSN),
-						   LSN_FORMAT_ARGS(commitLSN));
-			}
-
-			/* Record (in-memory) that a transaction is about to be applied. */
-			current.last_xid = xid;
-			current.last_txn_begin_lsn = beginLSN;
-			current.last_txn_end_lsn = InvalidXLogRecPtr;
-			current.last_txn_complete = false;
-			current.last_txn_processed = false;
-
-			if (!stream_apply_transaction(context, xid, begin_id, commitLSN))
-			{
-				/* errors have already been logged */
-				success = false;
-				break;
-			}
-
-			/* Transaction applied to target: record completion in-memory. */
-			current.last_txn_end_lsn = commitLSN;
-			current.last_txn_complete = true;
-			current.last_txn_processed = true;
-			current.run_end_lsn = context->previousLSN;
-
-			/* After commit: check if endpos has been reached. */
-			if (context->endpos != InvalidXLogRecPtr &&
-				context->endpos <= context->previousLSN)
-			{
-				context->reachedEndPos = true;
-
-				log_notice("Apply reached end position %X/%X after "
-						   "committing xid %u at %X/%X",
-						   LSN_FORMAT_ARGS(context->endpos),
-						   xid,
-						   LSN_FORMAT_ARGS(context->previousLSN));
-
-				/* ensure replay_lsn advances to endpos for follow_reached_endpos */
-				if (context->previousLSN < context->endpos)
-				{
-					context->previousLSN = context->endpos;
-				}
-				(void) stream_apply_sync_sentinel(context, false);
 				break;
 			}
 		}
 		else
 		{
-			/*
-			 * Non-transactional event: KEEPALIVE only.
-			 * ENDPOS rows no longer appear in the replay table.
-			 * SWITCH is no longer emitted by the pipeline.
-			 */
-			LogicalMessageMetadata metadata = { 0 };
+			/* every queued transaction up to endpos is applied */
+			bool atLimit = s->limit > 0 && s->head == s->limit;
+			bool atEndpos = context->endpos != InvalidXLogRecPtr &&
+							s->watermark >= context->endpos;
+			bool drained = s->fetchDone && s->head == s->tail;
 
-			metadata.action = s.action;
-			metadata.xid = s.xid;
-			metadata.lsn = s.lsn;
-
-			if (!IS_EMPTY_STRING_BUFFER(s.timestamp))
+			if (running == 0 && (atLimit || atEndpos || drained))
 			{
-				strlcpy(metadata.timestamp, s.timestamp,
-						sizeof(metadata.timestamp));
-			}
+				context->reachedEndPos = true;
 
-			if (!stream_apply_sql(context, &metadata, ""))
-			{
-				log_error("Failed to apply replayDB event (action %c, LSN %X/%X)",
-						  s.action,
-						  LSN_FORMAT_ARGS(s.lsn));
-				success = false;
+				/* a keepalive past endpos, like before: report endpos */
+				if (atLimit && s->head < s->tail &&
+					ENTRY(s, s->head)->kind == STREAM_ACTION_KEEPALIVE &&
+					s->watermark < context->endpos)
+				{
+					s->watermark = context->endpos;
+				}
+
+				log_notice("Apply reached end position %X/%X at LSN %X/%X",
+						   LSN_FORMAT_ARGS(context->endpos),
+						   LSN_FORMAT_ARGS(s->watermark));
 				break;
 			}
 
-			if (s.action == STREAM_ACTION_KEEPALIVE)
+			if (!apply_fetch(s, &fetched))
 			{
-				bool findDurableLSN = false;
-
-				if (!stream_apply_sync_sentinel(context, findDurableLSN))
-				{
-					log_warn("Failed to sync sentinel at LSN %X/%X, "
-							 "will retry on next iteration",
-							 LSN_FORMAT_ARGS(context->previousLSN));
-				}
-
-				/* record progress in the in-memory apply state */
-				current.run_end_lsn = context->previousLSN;
+				s->failed = true;
+				continue;
 			}
 
-			if (context->reachedEndPos)
+			if (!apply_dispatch(s, &dispatched))
 			{
-				log_info("Apply reached endpos %X/%X",
-						 LSN_FORMAT_ARGS(context->endpos));
+				s->failed = true;
+				continue;
+			}
+		}
 
-				/* ensure replay_lsn advances to endpos for follow_reached_endpos */
-				if (context->previousLSN < context->endpos)
-				{
-					context->previousLSN = context->endpos;
-				}
-				(void) stream_apply_sync_sentinel(context, false);
-				break;
+		if (!apply_persist(s, false))
+		{
+			s->failed = true;
+			continue;
+		}
+
+		if (time(NULL) - s->lastLog >= 10)
+		{
+			log_info("Apply: %llu transactions applied, at LSN %X/%X, "
+					 "%llu queued",
+					 (unsigned long long) s->applied,
+					 LSN_FORMAT_ARGS(s->watermark),
+					 (unsigned long long) (s->tail - s->head));
+			s->lastLog = time(NULL);
+		}
+
+		/* wait for a result, or for more work to show up */
+		if (!collected && !fetched && !dispatched)
+		{
+			if (!apply_collect(s, 50, &collected))
+			{
+				s->failed = true;
+				stopping = true;
 			}
 		}
 	}
 
-	if (lock_held)
+	return !s->failed;
+}
+
+
+/*
+ * apply_open_queue opens the replay.db file of the current position, once
+ * transform has created it.
+ */
+static bool
+apply_open_queue(ApplyScheduler *s, bool *ready)
+{
+	DatabaseCatalog *sourceDB = s->specs->sourceDB;
+	char lsn[PG_LSN_MAXLENGTH] = { 0 };
+	char outputFile[MAXPGPATH] = { 0 };
+
+	*ready = false;
+
+	sformat(lsn, sizeof(lsn), "%08X/%08X", LSN_FORMAT_ARGS(s->watermark));
+
+	char *sql =
+		s->watermark != InvalidXLogRecPtr
+		? "select id, filename from cdc_files where startpos <= $1 "
+		  "order by id desc limit 1"
+		: "select id, filename from cdc_files where $1 = $1 "
+		  "order by id limit 1";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(sourceDB->db, sql, &query))
 	{
-		(void) semaphore_unlock(&(replayDB->sema));
+		return false;
 	}
 
-	/* enforce a final durable checkpoint of the in-memory apply state */
-	(void) pipeline_state_sync(specs->sourceDB, &current);
-	specs->private.applyState = NULL;
+	sqlite3_bind_text(query.ppStmt, 1, lsn, -1, SQLITE_TRANSIENT);
+
+	int64_t id = 0;
+	int rc = catalog_sql_step(&query);
+
+	if (rc == SQLITE_ROW)
+	{
+		id = sqlite3_column_int64(query.ppStmt, 0);
+		strlcpy(outputFile, (char *) sqlite3_column_text(query.ppStmt, 1),
+				sizeof(outputFile));
+	}
+
+	(void) catalog_sql_finalize(&query);
+
+	if (id == 0)
+	{
+		/* when there is no CDC file and transform is done, nothing to do */
+		if (apply_transform_done(s))
+		{
+			s->fetchDone = true;
+		}
+
+		return true;
+	}
+
+	char replayFile[MAXPGPATH] = { 0 };
+
+	ld_store_replaydb_filename(outputFile, replayFile, sizeof(replayFile));
+
+	if (!file_exists(replayFile))
+	{
+		return true;
+	}
+
+	if (!ld_store_open_raw(&(s->replay), replayFile,
+						   DATABASE_CATALOG_TYPE_REPLAY, false))
+	{
+		return false;
+	}
+
+	/* transform may still be creating the schema */
+	uint64_t endlsn = 0;
+	bool switched = false;
+
+	if (!ld_store_replay_txn_last(&(s->replay), &endlsn, &switched))
+	{
+		ld_store_close_raw(&(s->replay));
+		return true;
+	}
+
+	s->fileId = id;
+	s->lastTxnId = 0;
+	*ready = true;
+
+	log_info("Apply reads its queue from \"%s\"", replayFile);
+
+	return true;
+}
+
+
+/*
+ * apply_fetch reads more of the apply queue into the scheduler window.
+ */
+static bool
+apply_fetch(ApplyScheduler *s, bool *fetched)
+{
+	*fetched = false;
+
+	if (s->fetchDone)
+	{
+		return true;
+	}
+
+	if (s->replay.db == NULL)
+	{
+		bool ready = false;
+
+		if (!apply_open_queue(s, &ready))
+		{
+			return false;
+		}
+
+		if (!ready)
+		{
+			return true;
+		}
+	}
+
+	uint64_t room = APPLY_WINDOW - (s->tail - s->head);
+
+	if (room == 0)
+	{
+		return true;
+	}
+
+	/* transform done before the read: then an empty read means the end */
+	bool transformDone = apply_transform_done(s);
+
+	ReplayDBTxn batch[APPLY_FETCH_BATCH];
+	int count = 0;
+	int limit = room < APPLY_FETCH_BATCH ? (int) room : APPLY_FETCH_BATCH;
+
+	if (!ld_store_replay_txn_fetch_batch(&(s->replay), s->lastTxnId, limit,
+										 batch, &count))
+	{
+		return false;
+	}
+
+	bool success = true;
+
+	for (int i = 0; i < count; i++)
+	{
+		ReplayDBTxn *txn = &(batch[i]);
+
+		if (success && !s->fetchDone)
+		{
+			s->lastTxnId = txn->id;
+
+			if (txn->kind == REPLAY_TXN_KIND_SWITCH)
+			{
+				/* this file pair is complete, the next one exists */
+				char *next =
+					"select id, filename from cdc_files where id > $1 "
+					"order by id limit 1";
+
+				SQLiteQuery query = { 0 };
+				int64_t id = 0;
+				char outputFile[MAXPGPATH] = { 0 };
+
+				if (!catalog_sql_prepare(s->specs->sourceDB->db, next, &query))
+				{
+					success = false;
+				}
+				else
+				{
+					sqlite3_bind_int64(query.ppStmt, 1, s->fileId);
+
+					if (catalog_sql_step(&query) == SQLITE_ROW)
+					{
+						id = sqlite3_column_int64(query.ppStmt, 0);
+						strlcpy(outputFile,
+								(char *) sqlite3_column_text(query.ppStmt, 1),
+								sizeof(outputFile));
+					}
+
+					(void) catalog_sql_finalize(&query);
+				}
+
+				char replayFile[MAXPGPATH] = { 0 };
+
+				if (id > 0)
+				{
+					ld_store_replaydb_filename(outputFile, replayFile,
+											   sizeof(replayFile));
+				}
+
+				if (id == 0 ||
+					!ld_store_open_raw(&(s->replay), replayFile,
+									   DATABASE_CATALOG_TYPE_REPLAY, false))
+				{
+					log_error("Failed to open the CDC file pair after %lld",
+							  (long long) s->fileId);
+					success = false;
+				}
+				else
+				{
+					log_info("Apply moved to \"%s\"", replayFile);
+					s->fileId = id;
+					s->lastTxnId = 0;
+					*fetched = true;
+				}
+			}
+			else if (!apply_enqueue(s, txn))
+			{
+				success = false;
+			}
+			else
+			{
+				*fetched = true;
+			}
+		}
+
+		ld_store_replay_txn_free(txn);
+	}
+
+	if (success && count == 0 && transformDone)
+	{
+		s->fetchDone = true;
+	}
 
 	return success;
+}
+
+
+/*
+ * apply_enqueue adds a row of the apply queue to the window, and computes
+ * the entries it has to wait for.
+ */
+static bool
+apply_enqueue(ApplyScheduler *s, ReplayDBTxn *txn)
+{
+	ApplyEntry *e = ENTRY(s, s->tail);
+
+	bzero(e, sizeof(ApplyEntry));
+
+	e->seq = s->tail;
+	e->kind = txn->kind;
+	e->xid = txn->xid;
+	e->begin_id = txn->begin_id;
+	e->lsn = txn->lsn;
+	e->endlsn = txn->endlsn;
+	e->state = APPLY_ENTRY_PENDING;
+
+	/* where workers read this transaction */
+	if (s->nfiles == 0 || !streq(s->files[s->nfiles - 1], s->replay.dbfile))
+	{
+		char (*files)[MAXPGPATH] =
+			realloc(s->files, (s->nfiles + 1) * sizeof(*s->files));
+
+		if (files == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		s->files = files;
+		strlcpy(s->files[s->nfiles++], s->replay.dbfile, MAXPGPATH);
+	}
+
+	e->file = s->nfiles - 1;
+
+	bool applied = false;
+
+	if (txn->kind == REPLAY_TXN_KIND_TXN)
+	{
+		ApplySkip *skip = NULL;
+
+		HASH_FIND(hh, s->skip, &(txn->endlsn), sizeof(txn->endlsn), skip);
+
+		/* applied before a restart, or nothing to apply */
+		applied = txn->endlsn <= s->watermark || skip != NULL || txn->keys == NULL;
+	}
+	else
+	{
+		/* keepalive and rollback: nothing to apply */
+		applied = true;
+	}
+
+	if (applied)
+	{
+		e->state = APPLY_ENTRY_DONE;
+	}
+	else
+	{
+		bool barrier = false;
+
+		if (!depkeys_parse(txn->keys, &(e->keys), &(e->nkeys), &barrier))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		e->barrier = barrier || apply_tables_need_barrier(s, txn->tables);
+
+		/* at most one dependency per key, plus the last barrier */
+		e->deps = (uint64_t *) calloc(e->nkeys + 1, sizeof(uint64_t));
+
+		if (e->deps == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		if (s->lastBarrier > 0)
+		{
+			uint64_t b = s->lastBarrier - 1;
+
+			if (b >= s->head && ENTRY(s, b)->state != APPLY_ENTRY_DONE)
+			{
+				e->deps[e->ndeps++] = b;
+			}
+		}
+
+		for (int i = 0; i < e->nkeys; i++)
+		{
+			ApplyKeyOwner *owner = NULL;
+
+			HASH_FIND(hh, s->owners, &(e->keys[i]), sizeof(uint64_t), owner);
+
+			if (owner == NULL)
+			{
+				owner = (ApplyKeyOwner *) calloc(1, sizeof(ApplyKeyOwner));
+
+				if (owner == NULL)
+				{
+					log_error(ALLOCATION_FAILED_ERROR);
+					return false;
+				}
+
+				owner->key = e->keys[i];
+				HASH_ADD(hh, s->owners, key, sizeof(owner->key), owner);
+			}
+			else if (owner->seq >= s->head &&
+					 ENTRY(s, owner->seq)->state != APPLY_ENTRY_DONE)
+			{
+				e->deps[e->ndeps++] = owner->seq;
+			}
+
+			owner->seq = e->seq;
+		}
+
+		if (e->barrier)
+		{
+			s->lastBarrier = e->seq + 1;
+		}
+	}
+
+	++s->tail;
+
+	apply_check_endpos(s);
+
+	return true;
+}
+
+
+/*
+ * apply_check_endpos stops the queue at endpos: transactions committed up to
+ * endpos are applied, then the first one committed after endpos when it
+ * began before endpos (endpos in the middle of it), and none after that.
+ */
+static void
+apply_check_endpos(ApplyScheduler *s)
+{
+	uint64_t endpos = s->context->endpos;
+
+	if (endpos == InvalidXLogRecPtr || s->limit > 0)
+	{
+		return;
+	}
+
+	for (uint64_t seq = s->head; seq < s->tail; seq++)
+	{
+		ApplyEntry *e = ENTRY(s, seq);
+
+		/* sent to a worker before endpos was known: it cannot be held back */
+		if (e->endlsn <= endpos || e->sent)
+		{
+			continue;
+		}
+
+		bool midTxn = e->kind == REPLAY_TXN_KIND_TXN && e->lsn < endpos;
+
+		s->limit = midTxn ? seq + 1 : seq;
+		s->fetchDone = true;
+
+		log_notice("Apply stops at endpos %X/%X, before the changes "
+				   "committed at %X/%X",
+				   LSN_FORMAT_ARGS(endpos),
+				   LSN_FORMAT_ARGS(midTxn && seq + 1 < s->tail
+								   ? ENTRY(s, seq + 1)->endlsn
+								   : e->endlsn));
+		return;
+	}
+}
+
+
+/*
+ * apply_entry_ready is true when every entry this one waits for is done.
+ */
+static bool
+apply_entry_ready(ApplyScheduler *s, ApplyEntry *e)
+{
+	/* a barrier runs alone, after everything before it */
+	if (e->barrier)
+	{
+		return e->seq == s->head;
+	}
+
+	for (int i = 0; i < e->ndeps; i++)
+	{
+		uint64_t dep = e->deps[i];
+
+		if (dep >= s->head && ENTRY(s, dep)->state != APPLY_ENTRY_DONE)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * apply_dispatch sends the ready entries to the idle workers, oldest first.
+ */
+static bool
+apply_dispatch(ApplyScheduler *s, bool *dispatched)
+{
+	StreamApplyContext *context = s->context;
+
+	*dispatched = false;
+
+	int idle = 0;
+
+	for (int k = 0; k < s->jobs; k++)
+	{
+		idle += s->workers[k].busy ? 0 : 1;
+	}
+
+	uint64_t end = s->limit > 0 ? Min(s->limit, s->tail) : s->tail;
+
+	for (uint64_t seq = s->head; seq < end && idle > 0; seq++)
+	{
+		ApplyEntry *e = ENTRY(s, seq);
+
+		if (e->state != APPLY_ENTRY_PENDING)
+		{
+			continue;
+		}
+
+		if (!apply_entry_ready(s, e))
+		{
+			/* nothing runs beside a barrier waiting for its turn */
+			if (e->barrier)
+			{
+				break;
+			}
+
+			continue;
+		}
+
+		int k = 0;
+
+		while (s->workers[k].busy)
+		{
+			++k;
+		}
+
+		ApplyJob job = {
+			.seq = e->seq,
+			.xid = e->xid,
+			.begin_id = e->begin_id,
+			.commitLSN = e->endlsn,
+			.sync = context->endpos != InvalidXLogRecPtr &&
+					context->endpos <= e->endlsn
+		};
+
+		strlcpy(job.replayFile, s->files[e->file], sizeof(job.replayFile));
+
+		if (!apply_write_full(s->workers[k].jobFd, &job, sizeof(job)))
+		{
+			log_error("Failed to send transaction %u to apply worker %d",
+					  e->xid, k);
+			return false;
+		}
+
+		e->state = APPLY_ENTRY_RUNNING;
+		e->sent = true;
+		s->workers[k].busy = true;
+		--idle;
+		*dispatched = true;
+
+		if (e->barrier)
+		{
+			++s->barriers;
+
+			/* nothing else starts until the barrier is done */
+			break;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * apply_collect reads the results the workers sent, waiting at most
+ * timeoutMs for one.
+ */
+static bool
+apply_collect(ApplyScheduler *s, int timeoutMs, bool *collected)
+{
+	*collected = false;
+
+	for (;;)
+	{
+		fd_set rfds;
+		FD_ZERO(&rfds);
+		FD_SET(s->resultFd, &rfds);
+
+		struct timeval tv = {
+			.tv_sec = timeoutMs / 1000,
+			.tv_usec = (timeoutMs % 1000) * 1000
+		};
+
+		int nready = select(s->resultFd + 1, &rfds, NULL, NULL, &tv);
+
+		if (nready < 0)
+		{
+			if (errno == EINTR)
+			{
+				return true;
+			}
+
+			log_error("Failed to wait for the apply workers: %m");
+			return false;
+		}
+
+		if (nready == 0)
+		{
+			break;
+		}
+
+		ApplyResult result = { 0 };
+		bool eof = false;
+
+		if (!apply_read_full(s->resultFd, &result, sizeof(result), &eof) || eof)
+		{
+			log_error("Apply workers have exited");
+			return false;
+		}
+
+		*collected = true;
+		timeoutMs = 0;
+
+		if (result.worker < 0 || result.worker >= s->jobs ||
+			result.seq < s->head || result.seq >= s->tail)
+		{
+			log_error("BUG: unexpected apply result for seq %llu from worker %d",
+					  (unsigned long long) result.seq, result.worker);
+			return false;
+		}
+
+		s->workers[result.worker].busy = false;
+
+		ApplyEntry *e = ENTRY(s, result.seq);
+
+		if (!result.success)
+		{
+			log_error("Apply worker %d failed to apply transaction %u "
+					  "committed at %X/%X, see above for details",
+					  result.worker, e->xid, LSN_FORMAT_ARGS(e->endlsn));
+
+			/* the transaction is not applied: do not move past it */
+			s->failed = true;
+			continue;
+		}
+
+		e->state = APPLY_ENTRY_DONE;
+		++s->applied;
+	}
+
+	/* a worker that died without a word */
+	for (int k = 0; k < s->jobs; k++)
+	{
+		int status = 0;
+
+		if (s->workers[k].pid > 0 &&
+			waitpid(s->workers[k].pid, &status, WNOHANG) == s->workers[k].pid)
+		{
+			log_error("Apply worker %d (pid %d) has exited unexpectedly",
+					  k, s->workers[k].pid);
+			s->workers[k].pid = -1;
+			s->workers[k].busy = false;
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * apply_advance moves the head of the window past the done entries, and the
+ * watermark to the commit LSN of the last of them.
+ */
+static void
+apply_advance(ApplyScheduler *s)
+{
+	while (s->head < s->tail)
+	{
+		ApplyEntry *e = ENTRY(s, s->head);
+
+		if (e->state != APPLY_ENTRY_DONE)
+		{
+			break;
+		}
+
+		if (s->limit > 0 && s->head >= s->limit)
+		{
+			break;
+		}
+
+		/* a rollback has no commit to report */
+		if (e->kind != REPLAY_TXN_KIND_ROLLBACK && e->endlsn > s->watermark)
+		{
+			s->watermark = e->endlsn;
+		}
+
+		for (int i = 0; i < e->nkeys; i++)
+		{
+			ApplyKeyOwner *owner = NULL;
+
+			HASH_FIND(hh, s->owners, &(e->keys[i]), sizeof(uint64_t), owner);
+
+			if (owner != NULL && owner->seq == e->seq)
+			{
+				HASH_DEL(s->owners, owner);
+				free(owner);
+			}
+		}
+
+		free(e->keys);
+		free(e->deps);
+		e->keys = NULL;
+		e->deps = NULL;
+
+		++s->head;
+	}
+}
+
+
+/*
+ * apply_persist records the watermark: in the replication origin (with
+ * several workers, the scheduler advances it), and in the sentinel, which
+ * receive reports to the source as the flush position.
+ */
+static bool
+apply_persist(ApplyScheduler *s, bool force)
+{
+	StreamApplyContext *context = s->context;
+	uint64_t now = apply_now_ms();
+
+	/* not set up: apply was never enabled */
+	if (context->controlPgConn.connection == NULL)
+	{
+		return true;
+	}
+
+	if (!force && now - s->lastPersistMs < APPLY_PERSIST_INTERVAL_MS)
+	{
+		return true;
+	}
+
+	s->lastPersistMs = now;
+
+	if (s->tableMode && s->watermark > s->persisted)
+	{
+		char lsn[PG_LSN_MAXLENGTH] = { 0 };
+		char sql[BUFSIZE] = { 0 };
+
+		sformat(lsn, sizeof(lsn), "%X/%X", LSN_FORMAT_ARGS(s->watermark));
+
+		/*
+		 * A synchronous commit also flushes every commit of the workers
+		 * before it: the origin never runs ahead of the applied data.
+		 */
+		sformat(sql, sizeof(sql),
+				"begin; "
+				"set local synchronous_commit to on; "
+				"select pg_replication_origin_advance('%s', '%s'); "
+				"delete from " APPLY_PROGRESS_TABLE
+				" where origin = '%s' and commit_lsn <= '%s'; "
+				"commit",
+				context->origin, lsn, context->origin, lsn);
+
+		if (!pgsql_execute(&(context->controlPgConn), sql))
+		{
+			log_error("Failed to record apply progress at %s", lsn);
+			return false;
+		}
+
+		/* forget the skipped transactions below the watermark */
+		ApplySkip *skip, *tmp;
+
+		HASH_ITER(hh, s->skip, skip, tmp)
+		{
+			if (skip->lsn <= s->watermark)
+			{
+				HASH_DEL(s->skip, skip);
+				free(skip);
+			}
+		}
+	}
+
+	s->persisted = s->watermark;
+
+	if (context->previousLSN < s->watermark)
+	{
+		context->previousLSN = s->watermark;
+	}
+
+	uint64_t endpos = context->endpos;
+
+	if (!stream_apply_sync_sentinel(context, false))
+	{
+		log_warn("Failed to sync sentinel at LSN %X/%X",
+				 LSN_FORMAT_ARGS(context->previousLSN));
+	}
+
+	/* endpos can be set while we run */
+	if (context->endpos != endpos)
+	{
+		log_info("Apply endpos is now %X/%X", LSN_FORMAT_ARGS(context->endpos));
+		apply_check_endpos(s);
+	}
+
+	return true;
+}
+
+
+/*
+ * apply_scheduler_stop_workers closes the job pipes, which the workers read
+ * as the end of their work, and waits for them.
+ */
+static void
+apply_scheduler_stop_workers(ApplyScheduler *s)
+{
+	if (s->workers == NULL)
+	{
+		return;
+	}
+
+	for (int k = 0; k < s->jobs; k++)
+	{
+		if (s->workers[k].jobFd > 0)
+		{
+			close(s->workers[k].jobFd);
+			s->workers[k].jobFd = -1;
+		}
+	}
+
+	for (int k = 0; k < s->jobs; k++)
+	{
+		int status = 0;
+
+		if (s->workers[k].pid > 0)
+		{
+			(void) waitpid(s->workers[k].pid, &status, 0);
+			s->workers[k].pid = -1;
+		}
+	}
+
+	if (s->resultFd > 0)
+	{
+		close(s->resultFd);
+		s->resultFd = -1;
+	}
+}
+
+
+/*
+ * apply_transform_done is true when the transform process of this follow run
+ * has finished, or when there is none (it ran before us).
+ */
+static bool
+apply_transform_done(ApplyScheduler *s)
+{
+	StreamSpecs *specs = s->specs;
+
+	if (specs->transform.pid <= 0)
+	{
+		return true;
+	}
+
+	PipelineStateEntry ts = { 0 };
+
+	return pipeline_state_get(specs->sourceDB, "transform", &ts) &&
+		   ts.process_name[0] != '\0' &&
+		   strcmp(ts.run_state, "done") == 0 &&
+		   ts.pid == specs->transform.pid;
+}
+
+
+/*
+ * apply_tables_need_barrier is true when a transaction changes a relation
+ * that is a materialized view on the target: apply refreshes it, which reads
+ * other tables, so it runs alone.
+ */
+static bool
+apply_tables_need_barrier(ApplyScheduler *s, const char *tables)
+{
+	TargetRelkind *cache = s->context->targetRelkindCache;
+
+	if (tables == NULL || cache == NULL)
+	{
+		return false;
+	}
+
+	const char *p = tables;
+
+	while (*p != '\0')
+	{
+		const char *eol = strchr(p, '\n');
+		size_t len = eol != NULL ? (size_t) (eol - p) : strlen(p);
+
+		/* split nspname.relname on the first dot outside of quotes */
+		bool quoted = false;
+		size_t dot = len;
+
+		for (size_t i = 0; i < len; i++)
+		{
+			if (p[i] == '"')
+			{
+				quoted = !quoted;
+			}
+			else if (p[i] == '.' && !quoted)
+			{
+				dot = i;
+				break;
+			}
+		}
+
+		if (dot < len)
+		{
+			TargetRelkind lookup = { 0 };
+
+			sformat(lookup.nspname, sizeof(lookup.nspname), "%.*s",
+					(int) dot, p);
+			sformat(lookup.relname, sizeof(lookup.relname), "%.*s",
+					(int) (len - dot - 1), p + dot + 1);
+
+			unsigned keylen =
+				offsetof(TargetRelkind, relname) +
+				sizeof(lookup.relname) -
+				offsetof(TargetRelkind, nspname);
+
+			TargetRelkind *found = NULL;
+
+			HASH_FIND(hh, cache, lookup.nspname, keylen, found);
+
+			if (found != NULL && found->relkind == 'm')
+			{
+				return true;
+			}
+		}
+
+		p += len;
+
+		if (*p == '\n')
+		{
+			++p;
+		}
+	}
+
+	return false;
+}
+
+
+static uint64_t
+apply_now_ms(void)
+{
+	struct timespec ts = { 0 };
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	return (uint64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+
+static bool
+apply_read_full(int fd, void *buf, size_t len, bool *eof)
+{
+	size_t done = 0;
+
+	*eof = false;
+
+	while (done < len)
+	{
+		ssize_t n = read(fd, (char *) buf + done, len - done);
+
+		if (n == 0)
+		{
+			*eof = true;
+			return done == 0;
+		}
+
+		if (n < 0)
+		{
+			if (errno == EINTR)
+			{
+				continue;
+			}
+
+			log_error("Failed to read from the apply pipe: %m");
+			return false;
+		}
+
+		done += n;
+	}
+
+	return true;
+}
+
+
+static bool
+apply_write_full(int fd, const void *buf, size_t len)
+{
+	size_t done = 0;
+
+	while (done < len)
+	{
+		ssize_t n = write(fd, (const char *) buf + done, len - done);
+
+		if (n < 0)
+		{
+			if (errno == EINTR)
+			{
+				continue;
+			}
+
+			log_error("Failed to write to the apply pipe: %m");
+			return false;
+		}
+
+		done += n;
+	}
+
+	return true;
 }
 
 
@@ -674,13 +1808,11 @@ static bool
 stream_apply_transaction(StreamApplyContext *context,
 						 uint32_t xid,
 						 uint64_t begin_id,
-						 uint64_t commitLSN)
+						 uint64_t commitLSN,
+						 bool sync)
 {
 	PGSQL *applyPgConn = &(context->applyPgConn);
 	DatabaseCatalog *replayDB = context->replayDB;
-
-	bool sync = (context->endpos != InvalidXLogRecPtr &&
-				 context->endpos <= commitLSN);
 
 	if (!pgsql_begin(applyPgConn))
 	{
@@ -910,7 +2042,31 @@ stream_apply_transaction(StreamApplyContext *context,
 										   sizeof(commitTimestamp));
 	}
 
-	if (!pgsql_replication_origin_xact_setup(applyPgConn, lsn, commitTimestamp))
+	if (context->progressTable)
+	{
+		/*
+		 * Several workers commit out of source order: record this commit in
+		 * the same target transaction, the scheduler moves the replication
+		 * origin once every transaction before it is applied too.
+		 */
+		char progressSQL[BUFSIZE] = { 0 };
+
+		sformat(progressSQL, sizeof(progressSQL),
+				"insert into pgcopydb.apply_txn(origin, commit_lsn) "
+				"values('%s', '%s')",
+				context->origin, lsn);
+
+		if (!pgsql_execute(applyPgConn, progressSQL))
+		{
+			log_error("Failed to record the apply progress of xid %u at %X/%X",
+					  xid, LSN_FORMAT_ARGS(commitLSN));
+			(void) pgsql_execute(applyPgConn, "ROLLBACK");
+			context->transactionInProgress = false;
+			return false;
+		}
+	}
+	else if (!pgsql_replication_origin_xact_setup(applyPgConn, lsn,
+												  commitTimestamp))
 	{
 		log_error("Failed to setup replication origin for xid %u at %X/%X",
 				  xid, LSN_FORMAT_ARGS(commitLSN));
@@ -928,23 +2084,25 @@ stream_apply_transaction(StreamApplyContext *context,
 		return false;
 	}
 
+	/*
+	 * In pipeline mode the statements above are only sent: wait for the
+	 * results up to the COMMIT, so that the transaction is reported applied
+	 * only once the target has committed it, and any error is seen here.
+	 */
+	if (pqPipelineModeEnabled(applyPgConn->connection) &&
+		!pgsql_sync_pipeline(applyPgConn))
+	{
+		log_error("Failed to apply transaction %u committed at %X/%X on the "
+				  "source, see above for details",
+				  xid, LSN_FORMAT_ARGS(commitLSN));
+		context->transactionInProgress = false;
+		return false;
+	}
+
 	context->transactionInProgress = false;
 	context->previousLSN = commitLSN;
 
-	bool findDurableLSN = false;
-
-	if (!stream_apply_sync_sentinel(context, findDurableLSN))
-	{
-		log_warn("Failed to sync sentinel after xid %u at %X/%X, "
-				 "will retry on next iteration",
-				 xid, LSN_FORMAT_ARGS(commitLSN));
-	}
-
-	/*
-	 * The driver loop (stream_apply_replaydb) records completion of this
-	 * transaction in its in-memory pipeline state once we return, and
-	 * checkpoints it to sourceDB periodically and at end of processing.
-	 */
+	/* the scheduler reports progress, once the transactions before are done */
 	return true;
 }
 

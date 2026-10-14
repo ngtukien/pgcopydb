@@ -33,6 +33,7 @@
 	"  --dir                         Work directory to use\n" \
 	"  --table-jobs                  Number of concurrent COPY jobs to run\n" \
 	"  --index-jobs                  Number of concurrent CREATE INDEX jobs to run\n" \
+	"  --apply-jobs                  Number of concurrent apply connections (CDC)\n" \
 	"  --restore-jobs                Number of concurrent jobs for pg_restore\n" \
 	"  --large-objects-jobs          Number of concurrent Large Objects jobs to run\n" \
 	"  --split-tables-larger-than    Same-table concurrency size threshold\n" \

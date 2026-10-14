@@ -590,6 +590,7 @@ followDB(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 	}
 
 	FollowSubProcess *prefetch = &(streamSpecs->prefetch);
+	FollowSubProcess *transform = &(streamSpecs->transform);
 	FollowSubProcess *catchup = &(streamSpecs->catchup);
 
 	/*
@@ -601,6 +602,22 @@ followDB(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 		if (!follow_start_subprocess(streamSpecs, prefetch))
 		{
 			log_error("Failed to start the %s process", prefetch->name);
+			return false;
+		}
+	}
+
+	/*
+	 * In catchup mode transform runs in its own process, started right away:
+	 * it does not wait for apply to be enabled, nor for apply to keep up.
+	 * Apply is started after it, so that it knows the transform pid.
+	 */
+	if (streamSpecs->mode == STREAM_MODE_CATCHUP)
+	{
+		if (!follow_start_subprocess(streamSpecs, transform))
+		{
+			log_error("Failed to start the %s process", transform->name);
+
+			(void) follow_exit_early(streamSpecs);
 			return false;
 		}
 	}
@@ -668,8 +685,9 @@ followDB(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 
 	if (follow_wait_subprocesses(streamSpecs))
 	{
-		log_info("Subprocesses for %s and %s have now all exited",
+		log_info("Subprocesses for %s, %s and %s have now all exited",
 				 prefetch->name,
+				 transform->name,
 				 catchup->name);
 	}
 	else
@@ -741,6 +759,21 @@ follow_start_prefetch(StreamSpecs *specs)
 	}
 
 	return true;
+}
+
+
+/*
+ * follow_start_transform starts the sub-process that transforms the changes
+ * that receive writes into the SQL statements that apply runs.
+ */
+bool
+follow_start_transform(StreamSpecs *specs)
+{
+	bool success = stream_transform_worker(specs);
+
+	log_info("Transform process has terminated");
+
+	return success;
 }
 
 
@@ -911,13 +944,14 @@ follow_exit_early(StreamSpecs *specs)
 
 
 /*
- * follow_wait_subprocesses waits until both sub-processes are finished.
+ * follow_wait_subprocesses waits until all the sub-processes are finished.
  */
 bool
 follow_wait_subprocesses(StreamSpecs *specs)
 {
 	FollowSubProcess *processArray[] = {
 		&(specs->prefetch),
+		&(specs->transform),
 		&(specs->catchup)
 	};
 
@@ -1097,6 +1131,7 @@ follow_terminate_subprocesses(StreamSpecs *specs)
 {
 	FollowSubProcess *processArray[] = {
 		&(specs->prefetch),
+		&(specs->transform),
 		&(specs->catchup)
 	};
 	int count = sizeof(processArray) / sizeof(processArray[0]);

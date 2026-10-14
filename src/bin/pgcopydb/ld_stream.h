@@ -418,6 +418,9 @@ typedef struct StreamContext
 	/* per-table cache for the test_decoding parser hot path */
 	TestDecodingTableCache *testDecodingTableCache;
 
+	/* per-table classification of the parallel apply dependency keys */
+	struct DepTable *depTableCache;
+
 	/* relation cache for pgoutput binary protocol */
 	PgoutputRelationCache *pgoutputRelationCache;
 
@@ -564,6 +567,9 @@ typedef struct StreamApplyContext
 	bool transactionInProgress;
 	bool logSQL;
 
+	/* record each commit in pgcopydb.apply_txn rather than the origin */
+	bool progressTable;
+
 	PreparedStmt *preparedStmt;
 
 	/* target relkind cache: populated at startup, used for matview detection */
@@ -627,9 +633,13 @@ struct StreamSpecs
 	bool logSQL;
 	bool replayNoOpUpdates;
 
-	/* subprocess management: receive (prefetch) and apply (catchup) */
+	/* subprocess management: receive (prefetch), transform, apply (catchup) */
 	FollowSubProcess prefetch;
+	FollowSubProcess transform;
 	FollowSubProcess catchup;
+
+	/* number of apply worker processes (connections to the target) */
+	int applyJobs;
 
 	/* catalog handles: outputDB owned by receive, replayDB owned by apply */
 	DatabaseCatalog *sourceDB;
@@ -781,6 +791,9 @@ bool stream_transform_write_replay_txn(StreamSpecs *specs);
 bool stream_transform_context_init(StreamSpecs *specs);
 bool stream_transform_from_outputdb(StreamSpecs *specs, uint64_t previousLSN);
 
+bool stream_transform_worker(StreamSpecs *specs);
+bool stream_transform_drain(StreamSpecs *specs);
+
 bool stream_transform_message(StreamContext *privateContext,
 							  char *message);
 
@@ -828,7 +841,6 @@ bool parseWal2jsonMessage(StreamContext *privateContext,
 
 /* ld_apply.c */
 bool stream_apply_catchup(StreamSpecs *specs);
-bool stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context);
 bool stream_apply_stdin(StreamSpecs *specs, StreamApplyContext *context);
 bool stream_apply_to_stdout(StreamSpecs *specs, FILE *out);
 
@@ -891,6 +903,7 @@ bool follow_prepare_mode_switch(StreamSpecs *streamSpecs,
 bool follow_start_subprocess(StreamSpecs *specs, FollowSubProcess *subprocess);
 
 bool follow_start_prefetch(StreamSpecs *specs);
+bool follow_start_transform(StreamSpecs *specs);
 bool follow_start_catchup(StreamSpecs *specs);
 
 void follow_exit_early(StreamSpecs *specs);

@@ -2085,9 +2085,15 @@ pgsql_sync_pipeline(PGSQL *pgsql)
 		struct timeval timeout;
 		struct timeval *timeoutptr = NULL;
 
-		/* sleep for 10ms to wait for input on the Postgres socket */
+		/*
+		 * Wait up to 1ms for input on the Postgres socket. libpq may hold the
+		 * remaining results of the pipeline in its buffer already while
+		 * PQisBusy() reports busy, so the socket stays silent: a longer wait
+		 * here is added to every pipeline sync (10ms capped an apply worker
+		 * at about 90 transactions per second).
+		 */
 		timeout.tv_sec = 0;
-		timeout.tv_usec = 10000;
+		timeout.tv_usec = 1000;
 		timeoutptr = &timeout;
 
 		FD_ZERO(&input_mask);

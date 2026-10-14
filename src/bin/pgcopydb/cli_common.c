@@ -754,6 +754,7 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "publication", required_argument, NULL, 1003 },
 		{ "all-databases", no_argument, NULL, 1004 },
 		{ "replay-no-op-updates", no_argument, NULL, 1005 },
+		{ "apply-jobs", required_argument, NULL, 1006 },
 		{ "host", required_argument, NULL, 1001 },
 		{ "port", required_argument, NULL, 1002 },
 		{ "version", no_argument, NULL, 'V' },
@@ -1145,6 +1146,26 @@ cli_copy_db_getopts(int argc, char **argv)
 			{
 				options.replayNoOpUpdates = true;
 				log_trace("--replay-no-op-updates");
+				break;
+			}
+
+			case 1006:      /* --apply-jobs */
+			{
+				int applyJobs = 0;
+
+				if (!stringToInt(optarg, &applyJobs) ||
+					applyJobs < 1 ||
+					applyJobs > 128)
+				{
+					log_fatal("Failed to parse --apply-jobs count: \"%s\"", optarg);
+					++errors;
+				}
+				else
+				{
+					/* read by stream_init_specs, in this and the sub-processes */
+					setenv(PGCOPYDB_APPLY_JOBS, optarg, 1);
+					log_trace("--apply-jobs %d", applyJobs);
+				}
 				break;
 			}
 

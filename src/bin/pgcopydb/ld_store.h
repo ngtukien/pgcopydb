@@ -113,6 +113,65 @@ typedef bool (ReplayDBOutputIterFun)(StreamSpecs *specs,
 									 ReplayDBOutputMessage *output,
 									 bool *stop);
 
+/*
+ * A row of the replayDB txn table: the apply queue, in source commit order.
+ */
+typedef struct ReplayDBTxn
+{
+	uint64_t id;
+	StreamAction kind;          /* 'T' transaction, 'K' keepalive, 'X' switch */
+	uint32_t xid;
+	uint64_t begin_id;          /* replay.id of the BEGIN row */
+	uint64_t lsn;               /* BEGIN LSN */
+	uint64_t endlsn;            /* COMMIT LSN, or the keepalive LSN */
+	bool rollback;
+	char timestamp[PG_MAX_TIMESTAMP];
+	char *keys;                 /* malloc'ed area, see ld_depkeys.h */
+	char *tables;               /* malloc'ed area */
+} ReplayDBTxn;
+
+#define REPLAY_TXN_KIND_TXN 'T'
+#define REPLAY_TXN_KIND_ROLLBACK 'R'
+#define REPLAY_TXN_KIND_KEEPALIVE 'K'
+#define REPLAY_TXN_KIND_SWITCH 'X'
+
+bool ld_store_replaydb_begin(DatabaseCatalog *catalog);
+bool ld_store_replaydb_commit(DatabaseCatalog *catalog);
+bool ld_store_replaydb_rollback(DatabaseCatalog *catalog);
+
+bool ld_store_open_raw(DatabaseCatalog *catalog,
+					   const char *dbfile,
+					   DatabaseCatalogType type,
+					   bool create);
+void ld_store_close_raw(DatabaseCatalog *catalog);
+
+void ld_store_replaydb_filename(const char *outputFile,
+								char *replayFile,
+								size_t replayFileSize);
+
+bool ld_store_insert_replay_txn(DatabaseCatalog *catalog, ReplayDBTxn *txn);
+
+bool ld_store_replay_txn_last(DatabaseCatalog *catalog,
+							  uint64_t *endlsn,
+							  bool *switched);
+
+bool ld_store_replay_txn_fetch_batch(DatabaseCatalog *catalog,
+									 uint64_t afterId,
+									 int limit,
+									 ReplayDBTxn *array,
+									 int *count);
+
+void ld_store_replay_txn_free(ReplayDBTxn *txn);
+
+bool ld_store_lookup_output_next_unit(DatabaseCatalog *catalog,
+									  uint64_t cursor,
+									  ReplayDBOutputMessage *unit);
+
+bool ld_store_iter_output_unit(StreamSpecs *specs,
+							   ReplayDBOutputMessage *unit,
+							   ReplayDBOutputIterFun *callback,
+							   bool *found);
+
 bool ld_store_iter_output(StreamSpecs *specs, ReplayDBOutputIterFun *callback);
 
 typedef struct ReplayDBOutputIterator

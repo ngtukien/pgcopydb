@@ -121,6 +121,18 @@ ld_store_open_outputdb(StreamSpecs *specs)
 		return false;
 	}
 
+	/*
+	 * Receive inserts one row per message: an fsync at each of them caps the
+	 * stream at the disk sync rate. The source slot is acknowledged only up
+	 * to what apply made durable on the target (see streamFeedback), so after
+	 * an OS crash the slot sends again whatever output.db lost.
+	 */
+	if (!catalog_execute(outputDB, "PRAGMA synchronous = NORMAL"))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	if (createOutputDB)
 	{
 		if (!ld_store_insert_cdc_filename(specs))
@@ -2102,6 +2114,9 @@ ld_store_insert_replay_stmt(DatabaseCatalog *catalog,
 		return false;
 	}
 
+	/* the BEGIN row id is the starting point of the apply txn iterator */
+	replayStmt->id = sqlite3_last_insert_rowid(db);
+
 	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
@@ -3170,4 +3185,524 @@ ld_store_iter_replay_txn_finish(ReplayDBReplayTxnIterator *iter)
 	iter->current = NULL;
 
 	return true;
+}
+
+
+/*
+ * ld_store_replaydb_begin opens a SQLite transaction on the replayDB, so that
+ * transform writes a whole source transaction (replay rows and its txn row)
+ * at once: apply never sees half of it, and SQLite syncs once per
+ * transaction rather than once per row.
+ */
+bool
+ld_store_replaydb_begin(DatabaseCatalog *catalog)
+{
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	(void) sqlite3_busy_timeout(catalog->db, 10 * 1000);
+
+	if (!catalog_execute(catalog, "BEGIN IMMEDIATE"))
+	{
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	return true;
+}
+
+
+bool
+ld_store_replaydb_commit(DatabaseCatalog *catalog)
+{
+	bool success = catalog_execute(catalog, "COMMIT");
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return success;
+}
+
+
+bool
+ld_store_replaydb_rollback(DatabaseCatalog *catalog)
+{
+	bool success = catalog_execute(catalog, "ROLLBACK");
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return success;
+}
+
+
+/*
+ * ld_store_open_raw opens a CDC SQLite file (output.db or replay.db) without a
+ * semaphore: each CDC file has a single writer process, readers rely on SQLite
+ * WAL snapshots, and SysV semaphores are a scarce resource that would leak
+ * with every file rotation. When create is true a missing file is created
+ * with its schema; otherwise the file must exist.
+ */
+bool
+ld_store_open_raw(DatabaseCatalog *catalog,
+				  const char *dbfile,
+				  DatabaseCatalogType type,
+				  bool create)
+{
+	if (catalog->db != NULL)
+	{
+		if (streq(catalog->dbfile, dbfile))
+		{
+			return true;
+		}
+
+		sqlite3_close(catalog->db);
+		catalog->db = NULL;
+	}
+
+	bool exists = file_exists(dbfile);
+
+	if (!exists && !create)
+	{
+		log_error("Failed to open \"%s\": file does not exist", dbfile);
+		return false;
+	}
+
+	strlcpy(catalog->dbfile, dbfile, sizeof(catalog->dbfile));
+	catalog->type = type;
+
+	int flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0);
+
+	if (sqlite3_open_v2(dbfile, &(catalog->db), flags, NULL) != SQLITE_OK)
+	{
+		log_error("Failed to open \"%s\": %s", dbfile, sqlite3_errmsg(catalog->db));
+		sqlite3_close(catalog->db);
+		catalog->db = NULL;
+		return false;
+	}
+
+	(void) sqlite3_busy_timeout(catalog->db, 10 * 1000);
+
+	if (!exists)
+	{
+		if (!catalog_set_wal_mode(catalog) || !catalog_create_schema(catalog))
+		{
+			/* errors have already been logged */
+			sqlite3_close(catalog->db);
+			catalog->db = NULL;
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * ld_store_close_raw closes a file opened with ld_store_open_raw.
+ */
+void
+ld_store_close_raw(DatabaseCatalog *catalog)
+{
+	if (catalog->db != NULL)
+	{
+		sqlite3_close(catalog->db);
+		catalog->db = NULL;
+	}
+}
+
+
+/*
+ * ld_store_insert_replay_txn appends a row to the apply queue.
+ */
+bool
+ld_store_insert_replay_txn(DatabaseCatalog *catalog, ReplayDBTxn *txn)
+{
+	char *sql =
+		"insert into txn(kind, xid, begin_id, lsn, endlsn, timestamp, keys, tables) "
+		"values($1, $2, $3, $4, $5, $6, $7, $8)";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(catalog->db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	char kind[2] = { txn->kind, '\0' };
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_TEXT, "kind", 0, kind },
+		{ txn->xid > 0 ? BIND_PARAMETER_TYPE_INT64 : BIND_PARAMETER_TYPE_NULL,
+		  "xid", txn->xid, NULL },
+		{ txn->begin_id > 0 ? BIND_PARAMETER_TYPE_INT64 : BIND_PARAMETER_TYPE_NULL,
+		  "begin_id", txn->begin_id, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "lsn", txn->lsn, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "endlsn", txn->endlsn, NULL },
+		{ IS_EMPTY_STRING_BUFFER(txn->timestamp) ?
+		  BIND_PARAMETER_TYPE_NULL : BIND_PARAMETER_TYPE_TEXT,
+		  "timestamp", 0, txn->timestamp },
+		{ txn->keys != NULL ? BIND_PARAMETER_TYPE_TEXT : BIND_PARAMETER_TYPE_NULL,
+		  "keys", 0, txn->keys },
+		{ txn->tables != NULL ? BIND_PARAMETER_TYPE_TEXT : BIND_PARAMETER_TYPE_NULL,
+		  "tables", 0, txn->tables }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count) ||
+		!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	txn->id = sqlite3_last_insert_rowid(catalog->db);
+
+	return true;
+}
+
+
+/*
+ * ld_store_replay_txn_last returns where transform stopped in this replayDB:
+ * the highest commit (or keepalive) LSN queued, and whether the file pair is
+ * complete.
+ */
+bool
+ld_store_replay_txn_last(DatabaseCatalog *catalog,
+						 uint64_t *endlsn,
+						 bool *switched)
+{
+	char *sql =
+		"select coalesce(max(endlsn) filter (where kind <> 'X'), 0), "
+		"       count(*) filter (where kind = 'X') "
+		"  from txn";
+
+	sqlite3_stmt *ppStmt = NULL;
+
+	if (sqlite3_prepare_v2(catalog->db, sql, -1, &ppStmt, NULL) != SQLITE_OK)
+	{
+		log_error("Failed to prepare \"%s\": %s", sql, sqlite3_errmsg(catalog->db));
+		return false;
+	}
+
+	int rc = sqlite3_step(ppStmt);
+
+	if (rc != SQLITE_ROW)
+	{
+		log_error("Failed to execute \"%s\": %s", sql, sqlite3_errmsg(catalog->db));
+		sqlite3_finalize(ppStmt);
+		return false;
+	}
+
+	*endlsn = (uint64_t) sqlite3_column_int64(ppStmt, 0);
+	*switched = sqlite3_column_int64(ppStmt, 1) > 0;
+
+	sqlite3_finalize(ppStmt);
+
+	return true;
+}
+
+
+/*
+ * ld_store_replay_txn_fetch_batch fetches up to limit rows of the apply queue
+ * after the given id. The keys and tables of each row are malloc'ed, see
+ * ld_store_replay_txn_free.
+ */
+bool
+ld_store_replay_txn_fetch_batch(DatabaseCatalog *catalog,
+								uint64_t afterId,
+								int limit,
+								ReplayDBTxn *array,
+								int *count)
+{
+	char *sql =
+		"  select id, kind, xid, begin_id, lsn, endlsn, timestamp, keys, tables "
+		"    from txn "
+		"   where id > $1 "
+		"order by id "
+		"   limit $2";
+
+	*count = 0;
+
+	sqlite3_stmt *ppStmt = NULL;
+
+	if (sqlite3_prepare_v2(catalog->db, sql, -1, &ppStmt, NULL) != SQLITE_OK)
+	{
+		log_error("Failed to prepare \"%s\": %s", sql, sqlite3_errmsg(catalog->db));
+		return false;
+	}
+
+	sqlite3_bind_int64(ppStmt, 1, (sqlite3_int64) afterId);
+	sqlite3_bind_int(ppStmt, 2, limit);
+
+	int rc;
+
+	while ((rc = sqlite3_step(ppStmt)) == SQLITE_ROW)
+	{
+		ReplayDBTxn *txn = &(array[*count]);
+
+		bzero(txn, sizeof(ReplayDBTxn));
+
+		txn->id = sqlite3_column_int64(ppStmt, 0);
+
+		const char *kind = (const char *) sqlite3_column_text(ppStmt, 1);
+		txn->kind = kind != NULL ? kind[0] : REPLAY_TXN_KIND_TXN;
+
+		txn->xid = sqlite3_column_int64(ppStmt, 2);
+		txn->begin_id = sqlite3_column_int64(ppStmt, 3);
+		txn->lsn = sqlite3_column_int64(ppStmt, 4);
+		txn->endlsn = sqlite3_column_int64(ppStmt, 5);
+
+		if (sqlite3_column_type(ppStmt, 6) != SQLITE_NULL)
+		{
+			strlcpy(txn->timestamp,
+					(const char *) sqlite3_column_text(ppStmt, 6),
+					sizeof(txn->timestamp));
+		}
+
+		if (sqlite3_column_type(ppStmt, 7) != SQLITE_NULL)
+		{
+			txn->keys = strdup((const char *) sqlite3_column_text(ppStmt, 7));
+		}
+
+		if (sqlite3_column_type(ppStmt, 8) != SQLITE_NULL)
+		{
+			txn->tables = strdup((const char *) sqlite3_column_text(ppStmt, 8));
+		}
+
+		++(*count);
+	}
+
+	if (rc != SQLITE_DONE)
+	{
+		log_error("Failed to fetch the apply queue: %s",
+				  sqlite3_errmsg(catalog->db));
+		sqlite3_finalize(ppStmt);
+		return false;
+	}
+
+	sqlite3_finalize(ppStmt);
+
+	return true;
+}
+
+
+void
+ld_store_replay_txn_free(ReplayDBTxn *txn)
+{
+	free(txn->keys);
+	free(txn->tables);
+	txn->keys = NULL;
+	txn->tables = NULL;
+}
+
+
+/*
+ * ld_store_lookup_output_next_unit finds the next unit of work for transform:
+ * the COMMIT, ROLLBACK or KEEPALIVE row with the smallest LSN after the
+ * cursor.
+ *
+ * Logical decoding sends the transactions in commit order, and a BEGIN row
+ * carries the LSN of the first change of its transaction: when transactions
+ * overlap on the source, a transaction that began earlier can commit later.
+ * The cursor is then the last COMMIT LSN processed, never a BEGIN LSN.
+ *
+ * Each branch uses the (action, lsn) unique index with a limit of one row.
+ */
+bool
+ld_store_lookup_output_next_unit(DatabaseCatalog *catalog,
+								 uint64_t cursor,
+								 ReplayDBOutputMessage *unit)
+{
+	char *sql =
+		"select * from ("
+		"  select * from (select id, action, xid, lsn, timestamp, message, "
+		"                        nspname, relname, old_type from output "
+		"                  where action = 'C' and lsn > $1 order by lsn limit 1) "
+		"  union all "
+		"  select * from (select id, action, xid, lsn, timestamp, message, "
+		"                        nspname, relname, old_type from output "
+		"                  where action = 'R' and lsn > $1 order by lsn limit 1) "
+		"  union all "
+		"  select * from (select id, action, xid, lsn, timestamp, message, "
+		"                        nspname, relname, old_type from output "
+		"                  where action = 'K' and lsn > $1 order by lsn limit 1) "
+		") order by lsn, id limit 1";
+
+	bzero(unit, sizeof(ReplayDBOutputMessage));
+
+	SQLiteQuery query = {
+		.errorOnZeroRows = false,
+		.context = unit,
+		.fetchFunction = &ld_store_output_fetch
+	};
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "lsn", cursor, NULL }
+	};
+
+	if (!catalog_sql_prepare(catalog->db, sql, &query) ||
+		!catalog_sql_bind(&query, params, 1) ||
+		!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * ld_store_iter_output_unit calls the callback on every output row of a unit
+ * found by ld_store_lookup_output_next_unit: the keepalive row alone, or the
+ * BEGIN, the changes and the COMMIT (or ROLLBACK) of a transaction.
+ *
+ * A transaction is the rows of its xid from its last BEGIN before the COMMIT
+ * up to the COMMIT: when the slot re-delivers a transaction after a restart,
+ * its rows replace the previous ones with new ids, and an artificial ROLLBACK
+ * left by an earlier stop in the middle of the transaction is skipped.
+ *
+ * found is false when the BEGIN of the transaction is not in this file.
+ */
+bool
+ld_store_iter_output_unit(StreamSpecs *specs,
+						  ReplayDBOutputMessage *unit,
+						  ReplayDBOutputIterFun *callback,
+						  bool *found)
+{
+	DatabaseCatalog *catalog = specs->outputDB;
+	bool stop = false;
+
+	*found = true;
+
+	if (unit->action == STREAM_ACTION_KEEPALIVE)
+	{
+		return (*callback)(specs, unit, &stop);
+	}
+
+	ReplayDBOutputMessage begin = { 0 };
+
+	char *beginSQL =
+		"  select id, action, xid, lsn, timestamp, message, "
+		"         nspname, relname, old_type "
+		"    from output "
+		"   where action = 'B' and xid = $1 and id < $2 "
+		"order by id desc "
+		"   limit 1";
+
+	SQLiteQuery bq = {
+		.errorOnZeroRows = false,
+		.context = &begin,
+		.fetchFunction = &ld_store_output_fetch
+	};
+
+	BindParam bp[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "xid", unit->xid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "id", unit->id, NULL }
+	};
+
+	if (!catalog_sql_prepare(catalog->db, beginSQL, &bq) ||
+		!catalog_sql_bind(&bq, bp, 2) ||
+		!catalog_sql_execute_once(&bq))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	free(begin.jsonBuffer);
+
+	if (begin.id == 0)
+	{
+		*found = false;
+		return true;
+	}
+
+	char *sql =
+		"  select id, action, xid, lsn, timestamp, message, "
+		"         nspname, relname, old_type "
+		"    from output "
+		"   where id >= $1 and id <= $2 and xid = $3 "
+		"     and (action not in ('C', 'R') or id = $2) "
+		"order by id";
+
+	ReplayDBOutputMessage row = { 0 };
+
+	SQLiteQuery query = {
+		.context = &row,
+		.fetchFunction = &ld_store_output_fetch
+	};
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "begin", begin.id, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "end", unit->id, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "xid", unit->xid, NULL }
+	};
+
+	if (!catalog_sql_prepare(catalog->db, sql, &query) ||
+		!catalog_sql_bind(&query, params, 3))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	bool success = true;
+
+	for (;;)
+	{
+		int rc = catalog_sql_step(&query);
+
+		if (rc == SQLITE_DONE)
+		{
+			break;
+		}
+
+		if (rc != SQLITE_ROW)
+		{
+			log_error("Failed to iterate output rows of xid %u: %s",
+					  unit->xid, sqlite3_errmsg(catalog->db));
+			success = false;
+			break;
+		}
+
+		if (!ld_store_output_fetch(&query))
+		{
+			success = false;
+			break;
+		}
+
+		bool ok = (*callback)(specs, &row, &stop);
+
+		free(row.jsonBuffer);
+		row.jsonBuffer = NULL;
+
+		if (!ok)
+		{
+			success = false;
+			break;
+		}
+	}
+
+	if (!catalog_sql_finalize(&query))
+	{
+		return false;
+	}
+
+	return success;
+}
+
+
+/*
+ * ld_store_replaydb_filename is the public form of
+ * ld_store_replaydb_filename_from_outputdb.
+ */
+void
+ld_store_replaydb_filename(const char *outputFile,
+						   char *replayFile,
+						   size_t replayFileSize)
+{
+	ld_store_replaydb_filename_from_outputdb(outputFile, replayFile, replayFileSize);
 }

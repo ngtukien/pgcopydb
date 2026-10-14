@@ -274,8 +274,8 @@ stream_init_specs(StreamSpecs *specs,
 	/*
 	 * Now prepare for the follow mode sub-process management.
 	 *
-	 * 2-process pipeline: receive (prefetch) and apply (catchup).
-	 * Apply performs inline transform — no separate transform subprocess.
+	 * 3-process pipeline: receive (prefetch), transform and apply (catchup).
+	 * Transform runs on its own, ahead of apply, which only applies.
 	 *
 	 * In replay mode (no live Postgres), we use "replay" instead of "apply"
 	 * since there's no target database involved.
@@ -288,6 +288,12 @@ stream_init_specs(StreamSpecs *specs,
 		.pid = -1
 	};
 
+	FollowSubProcess transform = {
+		.name = "transform",
+		.command = &follow_start_transform,
+		.pid = -1
+	};
+
 	FollowSubProcess catchup = {
 		.name = replayMode ? "replay" : "apply",
 		.command = &follow_start_catchup,
@@ -295,7 +301,25 @@ stream_init_specs(StreamSpecs *specs,
 	};
 
 	specs->prefetch = prefetch;
+	specs->transform = transform;
 	specs->catchup = catchup;
+
+	/* --apply-jobs, or PGCOPYDB_APPLY_JOBS */
+	specs->applyJobs = 1;
+
+	if (env_exists(PGCOPYDB_APPLY_JOBS))
+	{
+		char jobs[BUFSIZE] = { 0 };
+
+		if (!get_env_copy(PGCOPYDB_APPLY_JOBS, jobs, sizeof(jobs)) ||
+			!stringToInt(jobs, &(specs->applyJobs)) ||
+			specs->applyJobs < 1 ||
+			specs->applyJobs > 128)
+		{
+			log_error("Failed to parse %s: \"%s\"", PGCOPYDB_APPLY_JOBS, jobs);
+			return false;
+		}
+	}
 
 	/*
 	 * In replay mode, the receive and apply processes communicate via a Unix

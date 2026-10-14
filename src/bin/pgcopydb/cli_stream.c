@@ -65,6 +65,7 @@ static CommandLine stream_setup_command =
 		"  --plugin                      Output plugin to use (pgoutput, test_decoding, wal2json)\n"
 		"  --wal2json-numeric-as-string  Print numeric data type as string when using wal2json output plugin\n"
 		"  --replay-no-op-updates        Replay UPDATE statements even when no column values changed\n"
+		"  --apply-jobs                  Number of concurrent apply connections to the target\n"
 		"  --slot-name                   Stream changes recorded by this slot\n"
 		"  --origin                      Name of the Postgres replication origin\n",
 		cli_stream_getopts,
@@ -226,6 +227,7 @@ cli_stream_getopts(int argc, char **argv)
 		{ "endpos", required_argument, NULL, 'E' },
 		{ "max-replaydb-size", required_argument, NULL, 1003 },
 		{ "replay-no-op-updates", no_argument, NULL, 1004 },
+		{ "apply-jobs", required_argument, NULL, 1006 },
 		{ "host", required_argument, NULL, 1001 },
 		{ "port", required_argument, NULL, 1002 },
 		{ "dry-run", no_argument, NULL, 1005 },
@@ -369,6 +371,25 @@ cli_stream_getopts(int argc, char **argv)
 			{
 				options.replayNoOpUpdates = true;
 				log_trace("--replay-no-op-updates");
+				break;
+			}
+
+			case 1006:      /* --apply-jobs */
+			{
+				int applyJobs = 0;
+
+				if (!stringToInt(optarg, &applyJobs) ||
+					applyJobs < 1 ||
+					applyJobs > 128)
+				{
+					log_fatal("Failed to parse --apply-jobs count: \"%s\"", optarg);
+					++errors;
+				}
+				else
+				{
+					setenv(PGCOPYDB_APPLY_JOBS, optarg, 1);
+					log_trace("--apply-jobs %d", applyJobs);
+				}
 				break;
 			}
 
@@ -1537,19 +1558,7 @@ cli_stream_apply(int argc, char **argv)
 	}
 	else
 	{
-		StreamApplyContext context = { 0 };
-
-		if (!stream_apply_setup(&specs, &context))
-		{
-			log_error("Failed to setup apply context");
-			exit(EXIT_CODE_INTERNAL_ERROR);
-		}
-
-		bool success = stream_apply_replaydb(&specs, &context);
-
-		(void) stream_apply_cleanup(&context);
-
-		if (!success)
+		if (!stream_apply_catchup(&specs))
 		{
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}

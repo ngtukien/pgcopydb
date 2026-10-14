@@ -652,6 +652,17 @@ static char *replayDBcreateDDLs[] = {
 
 	"create index r_xid on replay(xid)",
 	"create index r_lsn on replay(lsn)",
+
+	/*
+	 * txn — the apply queue, one row per unit of work in source commit order,
+	 * written by transform in the same SQLite transaction as the replay rows
+	 * it points to.  kind is 'T' (transaction), 'K' (keepalive) or 'X' (this
+	 * file pair is complete, apply moves on to the next one).  keys lists the
+	 * dependency keys of a transaction ('*' = barrier, NULL = no change).
+	 */
+	"create table txn("
+	"  id integer primary key, kind text, xid integer, begin_id integer, "
+	"  lsn integer, endlsn integer, timestamp text, keys text, tables text)",
 };
 
 
@@ -738,6 +749,7 @@ static char *outputDBdropDDLs[] = {
 };
 
 static char *replayDBdropDDLs[] = {
+	"drop table if exists txn",
 	"drop table if exists replay",
 	"drop table if exists stmt"
 };
