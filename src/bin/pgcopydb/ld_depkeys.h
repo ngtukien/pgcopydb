@@ -31,6 +31,14 @@
  *    exclusion constraint, or not found in the catalog), where any two
  *    changes are considered dependent.
  */
+/* a unique index on plain columns, other than the primary key */
+typedef struct DepUnique
+{
+	char name[PG_NAMEDATALEN];
+	int colCount;
+	char (*cols)[PG_NAMEDATALEN];           /* malloc'ed, index order */
+} DepUnique;
+
 typedef struct DepTable
 {
 	char nspname[PG_NAMEDATALEN];            /* compound hash key, part 1 */
@@ -39,6 +47,9 @@ typedef struct DepTable
 	bool rowLevel;
 	int pkeyCount;
 	char (*pkeys)[PG_NAMEDATALEN];          /* malloc'ed, attnum order */
+
+	int uniqueCount;
+	DepUnique *uniques;                     /* malloc'ed */
 
 	UT_hash_handle hh;
 } DepTable;

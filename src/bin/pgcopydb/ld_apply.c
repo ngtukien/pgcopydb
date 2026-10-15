@@ -88,6 +88,12 @@ static bool stream_apply_transaction(StreamApplyContext *context,
  * order than on the source, never two changes of a same row or a same
  * table-level key.
  *
+ * The unique constraints other than the primary key are not keyed: when the
+ * target raises a unique or exclusion violation, or a deadlock between two
+ * workers, the worker rolls back, and the scheduler runs that transaction
+ * again alone, once every transaction before it is applied and no other one
+ * runs. That is the order of the source: a violation then is a real error.
+ *
  * Progress is the watermark: the commit LSN up to which every transaction is
  * applied. With a single worker the worker commits in source order and the
  * replication origin tracks the watermark as before. With several workers,
@@ -113,6 +119,7 @@ typedef struct ApplyJob
 	uint64_t begin_id;
 	uint64_t commitLSN;
 	bool sync;
+	bool alone;                 /* retried alone: a conflict now is an error */
 	char replayFile[MAXPGPATH];
 } ApplyJob;
 
@@ -121,6 +128,7 @@ typedef struct ApplyResult
 	int worker;
 	uint64_t seq;
 	bool success;
+	bool retry;                 /* rolled back on a conflict: run it again */
 } ApplyResult;
 
 typedef enum
@@ -142,6 +150,7 @@ typedef struct ApplyEntry
 	int file;                   /* index in ApplyScheduler.files */
 	ApplyEntryState state;
 	bool sent;                  /* handed to a worker */
+	bool alone;                 /* conflicted once: runs again alone */
 
 	int nkeys;
 	uint64_t *keys;             /* malloc'ed */
@@ -185,6 +194,7 @@ typedef struct ApplyScheduler
 	uint64_t head;
 	uint64_t tail;
 	uint64_t lastBarrier;       /* seq + 1 of the last barrier, 0 when none */
+	uint64_t alone;             /* seq + 1 of the entry running alone, or 0 */
 	uint64_t limit;             /* entries from this seq are after endpos */
 	ApplyKeyOwner *owners;
 
@@ -204,6 +214,7 @@ typedef struct ApplyScheduler
 
 	uint64_t applied;
 	uint64_t barriers;
+	uint64_t retries;
 	uint64_t lastLog;
 	bool failed;
 } ApplyScheduler;
@@ -215,6 +226,8 @@ static bool apply_scheduler_run(ApplyScheduler *s);
 static void apply_scheduler_stop_workers(ApplyScheduler *s);
 static bool apply_start_workers(ApplyScheduler *s);
 static void apply_worker_main(ApplyScheduler *s, int k, int jobFd, int resultFd);
+static bool apply_conflict(const char *sqlstate);
+static bool apply_worker_reconnect(StreamApplyContext *context, int k);
 static bool apply_fetch(ApplyScheduler *s, bool *fetched);
 static bool apply_open_queue(ApplyScheduler *s, bool *ready);
 static bool apply_enqueue(ApplyScheduler *s, ReplayDBTxn *txn);
@@ -287,12 +300,13 @@ stream_apply_catchup(StreamSpecs *specs)
 	(void) pipeline_state_end(specs->sourceDB, "apply",
 							  context.previousLSN, success);
 
-	log_info("Applied %llu transactions with %d worker%s (%llu barriers), "
-			 "up to LSN %X/%X",
+	log_info("Applied %llu transactions with %d worker%s (%llu barriers, "
+			 "%llu retried alone), up to LSN %X/%X",
 			 (unsigned long long) s.applied,
 			 s.jobs,
 			 s.jobs > 1 ? "s" : "",
 			 (unsigned long long) s.barriers,
+			 (unsigned long long) s.retries,
 			 LSN_FORMAT_ARGS(context.previousLSN));
 
 	ld_store_close_raw(&(s.replay));
@@ -697,12 +711,30 @@ apply_worker_main(ApplyScheduler *s, int k, int jobFd, int resultFd)
 							  DATABASE_CATALOG_TYPE_REPLAY, false))
 		{
 			context->replayDB = &replay;
+			apply->sqlstate[0] = '\0';
 
 			result.success = stream_apply_transaction(context,
 													  job.xid,
 													  job.begin_id,
 													  job.commitLSN,
 													  job.sync);
+
+			/*
+			 * Rolled back on a conflict with a transaction another worker
+			 * runs or has not run yet: the scheduler runs it again alone. The
+			 * pipeline stopped at the error: start over on a new connection.
+			 */
+			if (!result.success && s->tableMode && !job.alone &&
+				apply_conflict(apply->sqlstate))
+			{
+				log_info("Apply worker %d: transaction %u committed at %X/%X "
+						 "conflicts on the target (SQLSTATE %s, see above), "
+						 "it runs again alone in source order",
+						 k, job.xid, LSN_FORMAT_ARGS(job.commitLSN),
+						 apply->sqlstate);
+
+				result.retry = apply_worker_reconnect(context, k);
+			}
 		}
 
 		if (!apply_write_full(resultFd, &result, sizeof(result)))
@@ -711,7 +743,7 @@ apply_worker_main(ApplyScheduler *s, int k, int jobFd, int resultFd)
 			break;
 		}
 
-		if (!result.success)
+		if (!result.success && !result.retry)
 		{
 			exitCode = EXIT_CODE_TARGET;
 			break;
@@ -722,6 +754,52 @@ apply_worker_main(ApplyScheduler *s, int k, int jobFd, int resultFd)
 	(void) pgsql_finish(apply);
 
 	exit(exitCode);
+}
+
+
+/*
+ * apply_conflict is true for the errors that applying in another order than
+ * the source can raise on the target: a unique or exclusion violation (a
+ * later transaction takes a value an earlier one frees), and a deadlock
+ * between two workers.
+ */
+static bool
+apply_conflict(const char *sqlstate)
+{
+	return streq(sqlstate, "23505") ||     /* unique_violation */
+		   streq(sqlstate, "23P01") ||     /* exclusion_violation */
+		   streq(sqlstate, "40P01");       /* deadlock_detected */
+}
+
+
+/*
+ * apply_worker_reconnect opens a new apply connection after a conflict, in
+ * pipeline mode, with no prepared statement yet.
+ */
+static bool
+apply_worker_reconnect(StreamApplyContext *context, int k)
+{
+	PGSQL *apply = &(context->applyPgConn);
+
+	(void) pgsql_finish(apply);
+
+	PreparedStmt *stmt, *tmp;
+
+	HASH_ITER(hh, context->preparedStmt, stmt, tmp)
+	{
+		HASH_DEL(context->preparedStmt, stmt);
+		free(stmt);
+	}
+
+	context->preparedStmt = NULL;
+
+	if (!setupConnection(apply, context) || !pgsql_enable_pipeline_mode(apply))
+	{
+		log_error("Apply worker %d failed to connect to the target again", k);
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -1273,6 +1351,12 @@ apply_dispatch(ApplyScheduler *s, bool *dispatched)
 
 	*dispatched = false;
 
+	/* a transaction retried after a conflict runs alone */
+	if (s->alone > 0)
+	{
+		return true;
+	}
+
 	int idle = 0;
 
 	for (int k = 0; k < s->jobs; k++)
@@ -1289,6 +1373,15 @@ apply_dispatch(ApplyScheduler *s, bool *dispatched)
 		if (e->state != APPLY_ENTRY_PENDING)
 		{
 			continue;
+		}
+
+		/*
+		 * Every transaction before it applied and no worker busy: nothing can
+		 * conflict with it anymore. Nothing after it starts meanwhile.
+		 */
+		if (e->alone && (e->seq != s->head || idle < s->jobs))
+		{
+			break;
 		}
 
 		if (!apply_entry_ready(s, e))
@@ -1315,7 +1408,8 @@ apply_dispatch(ApplyScheduler *s, bool *dispatched)
 			.begin_id = e->begin_id,
 			.commitLSN = e->endlsn,
 			.sync = context->endpos != InvalidXLogRecPtr &&
-					context->endpos <= e->endlsn
+					context->endpos <= e->endlsn,
+			.alone = e->alone
 		};
 
 		strlcpy(job.replayFile, s->files[e->file], sizeof(job.replayFile));
@@ -1332,6 +1426,12 @@ apply_dispatch(ApplyScheduler *s, bool *dispatched)
 		s->workers[k].busy = true;
 		--idle;
 		*dispatched = true;
+
+		if (e->alone)
+		{
+			s->alone = e->seq + 1;
+			break;
+		}
 
 		if (e->barrier)
 		{
@@ -1408,8 +1508,30 @@ apply_collect(ApplyScheduler *s, int timeoutMs, bool *collected)
 
 		ApplyEntry *e = ENTRY(s, result.seq);
 
+		if (s->alone == e->seq + 1)
+		{
+			s->alone = 0;
+		}
+
+		/* rolled back on a conflict: again, alone and in source order */
+		if (!result.success && result.retry)
+		{
+			e->state = APPLY_ENTRY_PENDING;
+			e->alone = true;
+			++s->retries;
+			continue;
+		}
+
 		if (!result.success)
 		{
+			if (e->alone)
+			{
+				log_error("Transaction %u committed at %X/%X failed again when "
+						  "applied alone in source order: the target differs "
+						  "from the source",
+						  e->xid, LSN_FORMAT_ARGS(e->endlsn));
+			}
+
 			log_error("Apply worker %d failed to apply transaction %u "
 					  "committed at %X/%X, see above for details",
 					  result.worker, e->xid, LSN_FORMAT_ARGS(e->endlsn));

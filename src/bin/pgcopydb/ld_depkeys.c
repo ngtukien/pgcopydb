@@ -9,10 +9,21 @@
  *
  * Apply runs with session_replication_role = replica, so foreign keys and
  * ordinary triggers do not fire on the target: what remains to order is the
- * changes to a same row, and the unique constraints. A table is then keyed
- * per row (table + primary key value) only when its primary key is its only
- * unique constraint; any other table is keyed as a whole. Whatever cannot be
+ * changes to a same row, and the unique (and exclusion) constraints. A table
+ * with a primary key is keyed per row (table + primary key value). Its other
+ * unique indexes, when they are btree indexes on plain columns, add a key per
+ * value written (the new tuple of an INSERT or an UPDATE): two transactions
+ * that write a same unique value run in source order. Any other unique or
+ * exclusion constraint (expression, partial, INCLUDE, NULLS NOT DISTINCT,
+ * COLLATE), or no primary key, keys the table as a whole. Whatever cannot be
  * classified with certainty makes the whole transaction a barrier.
+ *
+ * test_decoding does not send the old value of a unique column that an UPDATE
+ * or a DELETE frees, so freeing a value has no key: a later transaction that
+ * takes that value may run first, and the target raises a unique violation.
+ * The apply scheduler then runs that transaction again alone, once every
+ * transaction before it is applied, which is the order of the source. A
+ * violation then is an error: apply stops, it never applies out of order.
  */
 
 #include <inttypes.h>
@@ -44,6 +55,12 @@ static bool depkeys_add_tuple(DepKeySet *set, DepTable *table,
 static bool depkeys_add_tuple_array(DepKeySet *set, DepTable *table,
 									LogicalMessageTupleArray *tuples,
 									bool optional);
+static bool depkeys_add_unique_keys(DepKeySet *set, DepTable *table,
+									LogicalMessageTupleArray *tuples);
+static void depkeys_append_value(PQExpBuffer buf, LogicalMessageValue *v);
+static bool depkeys_add_hashed(DepKeySet *set, PQExpBuffer buf);
+static bool depkeys_parse_ident(const char **p, char *out, size_t size);
+static bool depkeys_parse_unique(const char *sql, DepUnique *unique);
 
 
 /*
@@ -156,7 +173,8 @@ depkeys_add_statement(StreamContext *privateContext,
 		case STREAM_ACTION_INSERT:
 		{
 			return depkeys_add_tuple_array(set, table, &(stmt->stmt.insert.new),
-										   false);
+										   false) &&
+				   depkeys_add_unique_keys(set, table, &(stmt->stmt.insert.new));
 		}
 
 		case STREAM_ACTION_UPDATE:
@@ -165,7 +183,8 @@ depkeys_add_statement(StreamContext *privateContext,
 			return depkeys_add_tuple_array(set, table, &(stmt->stmt.update.old),
 										   false) &&
 				   depkeys_add_tuple_array(set, table, &(stmt->stmt.update.new),
-										   true);
+										   true) &&
+				   depkeys_add_unique_keys(set, table, &(stmt->stmt.update.new));
 		}
 
 		case STREAM_ACTION_DELETE:
@@ -278,63 +297,16 @@ depkeys_add_tuple(DepKeySet *set, DepTable *table, LogicalMessageTuple *tuple,
 				break;
 			}
 
-			LogicalMessageValue *v = &(values->array[pos[k]]);
-
-			if (v->isNull)
-			{
-				appendPQExpBufferStr(buf, "|\x01");
-				continue;
-			}
-
-			switch (v->oid)
-			{
-				case BOOLOID:
-				{
-					appendPQExpBuffer(buf, "|%c", v->val.boolean ? 't' : 'f');
-					break;
-				}
-
-				case INT8OID:
-				{
-					appendPQExpBuffer(buf, "|%" PRIu64, v->val.int8);
-					break;
-				}
-
-				case FLOAT8OID:
-				{
-					appendPQExpBuffer(buf, "|%.17g", v->val.float8);
-					break;
-				}
-
-				default:
-				{
-					const char *str = v->val.str != NULL ? v->val.str : "";
-
-					appendPQExpBuffer(buf, "|%zu:%s", strlen(str), str);
-					break;
-				}
-			}
+			depkeys_append_value(buf, &(values->array[pos[k]]));
 		}
-
-		if (PQExpBufferBroken(buf))
-		{
-			log_error("Failed to compute a dependency key: Out of Memory");
-			destroyPQExpBuffer(buf);
-			free(pos);
-			return false;
-		}
-
-		uint32_t h1 = 0, h2 = 0;
-
-		hashlittle2(buf->data, buf->len, &h1, &h2);
-		destroyPQExpBuffer(buf);
 
 		if (set->barrier)
 		{
+			destroyPQExpBuffer(buf);
 			break;
 		}
 
-		if (!depkeys_add_key(set, ((uint64_t) h1 << 32) | h2))
+		if (!depkeys_add_hashed(set, buf))
 		{
 			free(pos);
 			return false;
@@ -344,6 +316,152 @@ depkeys_add_tuple(DepKeySet *set, DepTable *table, LogicalMessageTuple *tuple,
 	free(pos);
 
 	return true;
+}
+
+
+/*
+ * depkeys_add_unique_keys adds a key per unique value the tuples write, for
+ * each unique index on plain columns: the hash of the table, the index and
+ * the values. A row with a NULL in the index takes no value (NULLs are
+ * distinct), and a tuple without every column of the index (an UPDATE that
+ * leaves an unchanged TOAST value out) does not change that value.
+ */
+static bool
+depkeys_add_unique_keys(DepKeySet *set, DepTable *table,
+						LogicalMessageTupleArray *tuples)
+{
+	for (int t = 0; t < tuples->count && !set->barrier; t++)
+	{
+		LogicalMessageTuple *tuple = &(tuples->array[t]);
+
+		for (int u = 0; u < table->uniqueCount && !set->barrier; u++)
+		{
+			DepUnique *unique = &(table->uniques[u]);
+			int pos[INDEX_MAX_KEYS];
+			bool complete = true;
+
+			for (int k = 0; k < unique->colCount && complete; k++)
+			{
+				pos[k] = -1;
+
+				for (int c = 0; c < tuple->attributes.count; c++)
+				{
+					if (streq(tuple->attributes.array[c].attname,
+							  unique->cols[k]))
+					{
+						pos[k] = c;
+						break;
+					}
+				}
+
+				complete = pos[k] >= 0;
+			}
+
+			if (!complete)
+			{
+				continue;
+			}
+
+			for (int r = 0; r < tuple->values.count; r++)
+			{
+				LogicalMessageValues *values = &(tuple->values.array[r]);
+				bool hasNull = false;
+
+				for (int k = 0; k < unique->colCount && !hasNull; k++)
+				{
+					hasNull = pos[k] >= values->cols ||
+							  values->array[pos[k]].isNull;
+				}
+
+				if (hasNull)
+				{
+					continue;
+				}
+
+				PQExpBuffer buf = createPQExpBuffer();
+
+				appendPQExpBuffer(buf, "U|%s.%s|%s",
+								  table->nspname, table->relname, unique->name);
+
+				for (int k = 0; k < unique->colCount; k++)
+				{
+					depkeys_append_value(buf, &(values->array[pos[k]]));
+				}
+
+				if (!depkeys_add_hashed(set, buf))
+				{
+					return false;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * depkeys_append_value appends one column value to a key being built.
+ */
+static void
+depkeys_append_value(PQExpBuffer buf, LogicalMessageValue *v)
+{
+	if (v->isNull)
+	{
+		appendPQExpBufferStr(buf, "|\x01");
+		return;
+	}
+
+	switch (v->oid)
+	{
+		case BOOLOID:
+		{
+			appendPQExpBuffer(buf, "|%c", v->val.boolean ? 't' : 'f');
+			break;
+		}
+
+		case INT8OID:
+		{
+			appendPQExpBuffer(buf, "|%" PRIu64, v->val.int8);
+			break;
+		}
+
+		case FLOAT8OID:
+		{
+			appendPQExpBuffer(buf, "|%.17g", v->val.float8);
+			break;
+		}
+
+		default:
+		{
+			const char *str = v->val.str != NULL ? v->val.str : "";
+
+			appendPQExpBuffer(buf, "|%zu:%s", strlen(str), str);
+			break;
+		}
+	}
+}
+
+
+/*
+ * depkeys_add_hashed adds the hash of the key built in buf, and frees buf.
+ */
+static bool
+depkeys_add_hashed(DepKeySet *set, PQExpBuffer buf)
+{
+	if (PQExpBufferBroken(buf))
+	{
+		log_error("Failed to compute a dependency key: Out of Memory");
+		destroyPQExpBuffer(buf);
+		return false;
+	}
+
+	uint32_t h1 = 0, h2 = 0;
+
+	hashlittle2(buf->data, buf->len, &h1, &h2);
+	destroyPQExpBuffer(buf);
+
+	return depkeys_add_key(set, ((uint64_t) h1 << 32) | h2);
 }
 
 
@@ -616,13 +734,11 @@ depkeys_lookup_table(StreamContext *privateContext,
 	}
 	else
 	{
-		/* unique and exclusion constraints other than the primary key */
+		/* exclusion constraints: no value key can tell an overlap */
 		char *sql =
-			"select (select count(*) from s_index "
-			"         where tableoid = $1 and isunique and not isprimary) "
-			"     + (select count(*) "
-			"          from s_constraint c join s_index i on i.oid = c.indexoid "
-			"         where i.tableoid = $1 and c.sql like '%EXCLUDE%')";
+			"select count(*) "
+			"  from s_constraint c join s_index i on i.oid = c.indexoid "
+			" where i.tableoid = $1 and c.sql like '%EXCLUDE%'";
 
 		int64_t others = 0;
 
@@ -643,6 +759,71 @@ depkeys_lookup_table(StreamContext *privateContext,
 			free(item);
 			return NULL;
 		}
+
+		/* the other unique indexes: keyed per value when on plain columns */
+		char *uniqueSQL =
+			"select sql from s_index "
+			" where tableoid = $1 and isunique and not isprimary "
+			" order by oid";
+
+		SQLiteQuery uq = { 0 };
+
+		if (!catalog_sql_prepare(sourceDB->db, uniqueSQL, &uq) ||
+			!catalog_sql_bind(&uq, params, 1))
+		{
+			free(item);
+			return NULL;
+		}
+
+		for (;;)
+		{
+			int rc = catalog_sql_step(&uq);
+
+			if (rc == SQLITE_DONE)
+			{
+				break;
+			}
+
+			if (rc != SQLITE_ROW)
+			{
+				log_error("Failed to list the unique indexes of %s.%s: %s",
+						  nspname, relname, sqlite3_errmsg(sourceDB->db));
+				(void) catalog_sql_finalize(&uq);
+				free(item);
+				return NULL;
+			}
+
+			const char *indexdef = (const char *) sqlite3_column_text(uq.ppStmt, 0);
+			DepUnique *uniques =
+				realloc(item->uniques, (item->uniqueCount + 1) * sizeof(DepUnique));
+
+			if (uniques == NULL)
+			{
+				log_error(ALLOCATION_FAILED_ERROR);
+				(void) catalog_sql_finalize(&uq);
+				free(item);
+				return NULL;
+			}
+
+			item->uniques = uniques;
+
+			DepUnique *unique = &(item->uniques[item->uniqueCount]);
+
+			bzero(unique, sizeof(DepUnique));
+
+			if (indexdef != NULL && depkeys_parse_unique(indexdef, unique))
+			{
+				++item->uniqueCount;
+			}
+			else
+			{
+				log_debug("Unique index of %s.%s keys the table as a whole: %s",
+						  nspname, relname, indexdef ? indexdef : "");
+				++others;
+			}
+		}
+
+		(void) catalog_sql_finalize(&uq);
 
 		int pkeyCount = 0;
 
@@ -677,13 +858,168 @@ depkeys_lookup_table(StreamContext *privateContext,
 			item->rowLevel = true;
 		}
 
-		log_debug("Dependency keys of %s.%s are per %s",
-				  nspname, relname, item->rowLevel ? "row" : "table");
+		log_debug("Dependency keys of %s.%s are per %s (%d unique indexes "
+				  "keyed per value)",
+				  nspname, relname, item->rowLevel ? "row" : "table",
+				  item->rowLevel ? item->uniqueCount : 0);
+
+		if (!item->rowLevel)
+		{
+			item->uniqueCount = 0;
+		}
 	}
 
 	HASH_ADD(hh, privateContext->depTableCache, nspname, keylen, item);
 
 	return item;
+}
+
+
+/*
+ * depkeys_parse_ident reads one SQL identifier, quoted or not, unquoted into
+ * out, and moves *p past it.
+ */
+static bool
+depkeys_parse_ident(const char **p, char *out, size_t size)
+{
+	const char *s = *p;
+	size_t len = 0;
+
+	if (*s == '"')
+	{
+		for (++s; *s != '\0'; ++s)
+		{
+			if (*s == '"')
+			{
+				if (s[1] != '"')
+				{
+					break;
+				}
+				++s;
+			}
+
+			if (len + 1 >= size)
+			{
+				return false;
+			}
+			out[len++] = *s;
+		}
+
+		if (*s != '"' || len == 0)
+		{
+			return false;
+		}
+
+		++s;
+	}
+	else
+	{
+		/* what quote_ident leaves unquoted: [a-z_][a-z0-9_]* */
+		while ((*s >= 'a' && *s <= 'z') || *s == '_' ||
+			   (len > 0 && *s >= '0' && *s <= '9'))
+		{
+			if (len + 1 >= size)
+			{
+				return false;
+			}
+			out[len++] = *s++;
+		}
+
+		if (len == 0)
+		{
+			return false;
+		}
+	}
+
+	out[len] = '\0';
+	*p = s;
+
+	return true;
+}
+
+
+/*
+ * depkeys_parse_unique reads the definition of a unique index, as
+ * pg_get_indexdef prints it, and keeps the index when it is exactly a btree
+ * index on plain columns:
+ *
+ *   CREATE UNIQUE INDEX name ON [ONLY] table USING btree (col, ...)
+ *
+ * Anything else (an expression, an operator class, COLLATE, DESC, INCLUDE,
+ * NULLS NOT DISTINCT, WHERE) is false: that table is keyed as a whole.
+ */
+static bool
+depkeys_parse_unique(const char *sql, DepUnique *unique)
+{
+	const char *prefix = "CREATE UNIQUE INDEX ";
+	const char *using = " USING btree (";
+
+	if (strncmp(sql, prefix, strlen(prefix)) != 0)
+	{
+		return false;
+	}
+
+	const char *p = sql + strlen(prefix);
+
+	if (!depkeys_parse_ident(&p, unique->name, sizeof(unique->name)) ||
+		strncmp(p, " ON ", 4) != 0)
+	{
+		return false;
+	}
+
+	/* the table name may hold anything quoted: the column list follows */
+	p = strstr(p, using);
+
+	if (p == NULL)
+	{
+		return false;
+	}
+
+	p += strlen(using);
+
+	char cols[INDEX_MAX_KEYS][PG_NAMEDATALEN];
+	int count = 0;
+
+	for (;;)
+	{
+		if (count >= INDEX_MAX_KEYS ||
+			!depkeys_parse_ident(&p, cols[count], PG_NAMEDATALEN))
+		{
+			return false;
+		}
+
+		++count;
+
+		if (strncmp(p, ", ", 2) == 0)
+		{
+			p += 2;
+			continue;
+		}
+
+		break;
+	}
+
+	if (strcmp(p, ")") != 0)
+	{
+		return false;
+	}
+
+	unique->cols = calloc(count, sizeof(*unique->cols));
+
+	if (unique->cols == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	for (int k = 0; k < count; k++)
+	{
+		strlcpy(unique->cols[k], cols[k], PG_NAMEDATALEN);
+	}
+
+	unique->colCount = count;
+
+	return true;
 }
 
 
