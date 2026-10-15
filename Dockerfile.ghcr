@@ -1,0 +1,41 @@
+# pgcopydb of this fork (parallel apply, standalone transform) as ghcr.io/<owner>/pgcopydb, built by
+# .github/workflows/ghcr-image.yml. amd64 only, with the PostgreSQL clients 13-18: pgcopydb runs the
+# pg_dump/pg_restore found first on PATH, which must match the target major (a newer one writes
+# statements an older target does not know), e.g.
+#   docker run --rm -e PATH=/usr/lib/postgresql/14/bin:/usr/local/bin:/usr/bin:/bin \
+#     ghcr.io/<owner>/pgcopydb pgcopydb clone --follow ...
+FROM debian:bookworm-slim AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg build-essential \
+ && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+      > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends libpq-dev postgresql-server-dev-16 libgc-dev libedit-dev \
+      libicu-dev libkrb5-dev liblz4-dev libncurses-dev libpam-dev libreadline-dev libselinux1-dev \
+      libssl-dev libxml2-dev libxslt1-dev libzstd-dev zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# GIT-VERSION-GEN reads ./version first: the build context has no .git
+ARG VERSION=0.18-fork
+RUN printf '%s\n' "${VERSION}" > version \
+ && make -j"$(nproc)" bin && install -m 0755 src/bin/pgcopydb/pgcopydb /usr/local/bin/pgcopydb
+
+FROM debian:bookworm-slim
+ARG PG_CLIENTS="13 14 15 16 17 18"
+LABEL org.opencontainers.image.description="pgcopydb (fork ngtukien/pgcopydb) with the PostgreSQL clients ${PG_CLIENTS}"
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && install -d /usr/share/postgresql-common/pgdg \
+ && curl -fsSLo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+ && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+      > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends libgc1 libpq5 $(for v in ${PG_CLIENTS}; do echo postgresql-client-$v; done) \
+ && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+COPY --from=build /usr/local/bin/pgcopydb /usr/local/bin/pgcopydb
+# Runs as any user (docker run -u): HOME for the client tools, a work directory everyone can write
+ENV HOME=/tmp
+RUN mkdir -p /var/run/pgcopydb && chmod 1777 /var/run/pgcopydb
+CMD ["pgcopydb", "--help"]

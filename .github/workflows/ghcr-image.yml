@@ -1,0 +1,66 @@
+# Image of this fork: ghcr.io/<owner>/pgcopydb (Dockerfile.ghcr, amd64, PostgreSQL clients 13-18).
+# Push to main: latest + sha-<short>. workflow_dispatch: any branch (branch name + sha-<short>).
+# The upstream "Docker" workflow (docker-publish.yml) is disabled in this fork: it would push the
+# same image name, multi-arch, with only the client 16.
+name: GHCR image
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Image name and version
+        id: name
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/pgcopydb" >> "$GITHUB_OUTPUT"
+          echo "version=0.18-fork.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=sha,format=short
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ghcr
+          build-args: VERSION=${{ steps.name.outputs.version }}
+          load: true
+          tags: pgcopydb:ci
+          cache-from: type=gha,scope=pgcopydb
+          cache-to: type=gha,scope=pgcopydb,mode=max
+      - name: Smoke test
+        run: |
+          docker run --rm -u 12345:12345 pgcopydb:ci pgcopydb --version | tee /tmp/version
+          grep -q "${{ steps.name.outputs.version }}" /tmp/version
+          for v in 13 14 15 16 17 18; do
+            docker run --rm pgcopydb:ci /usr/lib/postgresql/$v/bin/pg_dump --version | grep -q " $v\."
+          done
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ghcr
+          build-args: VERSION=${{ steps.name.outputs.version }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=pgcopydb
