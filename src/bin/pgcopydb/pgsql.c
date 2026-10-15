@@ -4761,11 +4761,25 @@ pgsql_stream_logical(LogicalStreamClient *client, LogicalStreamContext *context)
 	clear_results(pgsql);
 	pgsql_finish(pgsql);
 
-	/* unset the signals which have been processed correctly now */
+	/*
+	 * Unset the signals while the closeFunction callback runs, as before, then
+	 * set them again: the caller must still see that it was asked to stop,
+	 * else it reconnects and streams on (receive outlived a failed apply).
+	 */
+	sig_atomic_t stop = asked_to_stop;
+	sig_atomic_t stopFast = asked_to_stop_fast;
+	sig_atomic_t quit = asked_to_quit;
+
 	(void) unset_signal_flags();
 
 	/* call the closeFunction callback now */
-	if (!(*client->closeFunction)(context))
+	bool closed = (*client->closeFunction)(context);
+
+	asked_to_stop = asked_to_stop || stop;
+	asked_to_stop_fast = asked_to_stop_fast || stopFast;
+	asked_to_quit = asked_to_quit || quit;
+
+	if (!closed)
 	{
 		/* errors have already been logged */
 		return false;
